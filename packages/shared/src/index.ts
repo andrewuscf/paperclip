@@ -77,6 +77,11 @@ export {
   type CaseTypePipelineRef,
 } from "./pipeline-case-type.js";
 export {
+  applyRoutineRunDispositionSchema,
+  routineRunDispositionCapability,
+  type ApplyRoutineRunDisposition,
+} from "./validators/routine-run-disposition.js";
+export {
   deriveResponsibleUser,
   deriveOriginatingActor,
   type ResponsibleUserAttribution,

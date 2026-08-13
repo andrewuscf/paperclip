@@ -921,3 +921,8 @@ export {
 } from "./tool-access.js";
 export * from "./skill-policy.js";
 export * from "./app-definition.js";
+export {
+  applyRoutineRunDispositionSchema,
+  routineRunDispositionCapability,
+  type ApplyRoutineRunDisposition,
+} from "./routine-run-disposition.js";

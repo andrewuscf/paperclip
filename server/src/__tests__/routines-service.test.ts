@@ -2342,6 +2342,175 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(runsAfterResume.some((run) => run.status === "issue_created")).toBe(true);
   });
 
+  async function runStaleScheduledDispatchRace(input: {
+    expectedReason: "routine_not_active" | "trigger_not_active" | "routine_changed";
+    mutateAfterClaim: (
+      tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+      context: {
+        companyId: string;
+        routine: typeof routines.$inferSelect;
+        trigger: typeof routineTriggers.$inferSelect;
+      },
+    ) => Promise<void>;
+  }) {
+    const { companyId, routine, svc, wakeups } = await seedFixture();
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "schedule",
+        label: "pause-race",
+        cronExpression: "0 0 * * *",
+        timezone: "UTC",
+      },
+      {},
+    );
+    const pastDue = new Date("2020-01-01T00:00:00.000Z");
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt: pastDue })
+      .where(eq(routineTriggers.id, trigger.id));
+
+    let allowMutation!: () => void;
+    const schedulerClaimed = new Promise<void>((resolve) => {
+      allowMutation = resolve;
+    });
+    let routineRowLocked!: () => void;
+    const mutationHasRoutineLock = new Promise<void>((resolve) => {
+      routineRowLocked = resolve;
+    });
+    const mutationTransaction = db.transaction(async (tx) => {
+      await tx
+        .select({ id: routines.id })
+        .from(routines)
+        .where(eq(routines.id, routine.id))
+        .for("update");
+      routineRowLocked();
+      await schedulerClaimed;
+      await input.mutateAfterClaim(tx, { companyId, routine, trigger });
+    });
+
+    await mutationHasRoutineLock;
+    const tick = svc.tickScheduledTriggers(new Date("2026-08-13T12:00:00.000Z"));
+    try {
+      const claimDeadline = Date.now() + 5_000;
+      for (;;) {
+        const claimedTrigger = await db
+          .select({ nextRunAt: routineTriggers.nextRunAt })
+          .from(routineTriggers)
+          .where(eq(routineTriggers.id, trigger.id))
+          .then((rows) => rows[0] ?? null);
+        if (claimedTrigger?.nextRunAt && claimedTrigger.nextRunAt > pastDue) break;
+        if (Date.now() >= claimDeadline) {
+          throw new Error("Scheduler did not claim the active routine snapshot before the concurrent mutation");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      allowMutation();
+    }
+
+    await mutationTransaction;
+    await expect(tick).resolves.toEqual({ triggered: 0 });
+    await expect(db.select().from(issues).where(eq(issues.companyId, companyId))).resolves.toHaveLength(0);
+    await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).resolves.toHaveLength(0);
+    expect(wakeups).toHaveLength(0);
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.routineId, routine.id))).resolves.toMatchObject([
+      {
+        source: "schedule",
+        status: "skipped",
+        failureReason: input.expectedReason,
+        linkedIssueId: null,
+        idempotencyKey: `schedule:${trigger.id}:${pastDue.toISOString()}:0`,
+      },
+    ]);
+  }
+
+  it("suppresses a stale scheduled dispatch when a routine pause commits after the active snapshot", async () => {
+    await runStaleScheduledDispatchRace({
+      expectedReason: "routine_not_active",
+      mutateAfterClaim: async (tx, { routine }) => {
+        await tx
+          .update(routines)
+          .set({ status: "paused", updatedAt: new Date() })
+          .where(eq(routines.id, routine.id));
+      },
+    });
+  });
+
+  it("suppresses a stale scheduled dispatch when its trigger is disabled after the scheduler claim", async () => {
+    await runStaleScheduledDispatchRace({
+      expectedReason: "trigger_not_active",
+      mutateAfterClaim: async (tx, { trigger }) => {
+        await tx
+          .update(routineTriggers)
+          .set({ enabled: false, updatedAt: new Date() })
+          .where(eq(routineTriggers.id, trigger.id));
+      },
+    });
+  });
+
+  it("suppresses a stale scheduled dispatch when its routine revision changes after the scheduler claim", async () => {
+    await runStaleScheduledDispatchRace({
+      expectedReason: "routine_changed",
+      mutateAfterClaim: async (tx, { companyId, routine }) => {
+        const currentRoutine = await tx
+          .select()
+          .from(routines)
+          .where(eq(routines.id, routine.id))
+          .then((rows) => rows[0]!);
+        const latestRevision = await tx
+          .select({ snapshot: routineRevisions.snapshot })
+          .from(routineRevisions)
+          .where(eq(routineRevisions.id, currentRoutine.latestRevisionId!))
+          .then((rows) => rows[0]!);
+        const nextRevisionId = randomUUID();
+        await tx.insert(routineRevisions).values({
+          id: nextRevisionId,
+          companyId,
+          routineId: routine.id,
+          revisionNumber: currentRoutine.latestRevisionNumber + 1,
+          title: routine.title,
+          description: routine.description,
+          snapshot: latestRevision.snapshot,
+          changeSummary: "Concurrent revision race",
+          responsibleUserId: routine.responsibleUserId,
+        });
+        await tx
+          .update(routines)
+          .set({
+            latestRevisionId: nextRevisionId,
+            latestRevisionNumber: currentRoutine.latestRevisionNumber + 1,
+            updatedAt: new Date(),
+          })
+          .where(eq(routines.id, routine.id));
+      },
+    });
+  });
+
+  it("suppresses a stale scheduled dispatch when its routine is reassigned after the scheduler claim", async () => {
+    await runStaleScheduledDispatchRace({
+      expectedReason: "routine_changed",
+      mutateAfterClaim: async (tx, { companyId, routine }) => {
+        const replacementAgentId = randomUUID();
+        await tx.insert(agents).values({
+          id: replacementAgentId,
+          companyId,
+          name: "Replacement Runner",
+          role: "engineer",
+          status: "active",
+          adapterType: "codex_local",
+          adapterConfig: {},
+          runtimeConfig: {},
+          permissions: {},
+        });
+        await tx
+          .update(routines)
+          .set({ assigneeAgentId: replacementAgentId, updatedAt: new Date() })
+          .where(eq(routines.id, routine.id));
+      },
+    });
+  });
+
   it("skips a gated scheduled tick when quiet without advancing the activity window", async () => {
     const { companyId, routine, svc } = await seedFixture();
     await db.update(routines).set({

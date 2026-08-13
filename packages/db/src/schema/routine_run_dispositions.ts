@@ -1,0 +1,51 @@
+import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { agents } from "./agents.js";
+import { companies } from "./companies.js";
+import { heartbeatRuns } from "./heartbeat_runs.js";
+import { issues } from "./issues.js";
+import { routineRuns } from "./routines.js";
+
+export type RoutineRunDispositionReceipt = {
+  id: string;
+  idempotencyKey: string;
+  companyId: string;
+  issueId: string;
+  routineRunId: string;
+  heartbeatRunId: string;
+  actorAgentId: string;
+  outcome: "completed" | "blocked" | "escalated";
+  issueStatus: "done" | "blocked" | "in_review";
+  issueAssigneeAgentId: string | null;
+  routineRunStatus: "completed" | "failed";
+  commentId: string;
+  appliedAt: string;
+};
+
+/** Durable, unique receipts for the one atomic disposition allowed per routine run. */
+export const routineRunDispositions = pgTable(
+  "routine_run_dispositions",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    routineRunId: uuid("routine_run_id").notNull().references(() => routineRuns.id, { onDelete: "cascade" }),
+    issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
+    heartbeatRunId: uuid("heartbeat_run_id").notNull().references(() => heartbeatRuns.id, { onDelete: "restrict" }),
+    actorAgentId: uuid("actor_agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
+    idempotencyKey: text("idempotency_key").notNull(),
+    requestSha256: text("request_sha256").notNull(),
+    receipt: jsonb("receipt").$type<RoutineRunDispositionReceipt>().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => ({
+    routineRunUq: uniqueIndex("routine_run_dispositions_routine_run_uq").on(table.routineRunId),
+    heartbeatKeyUq: uniqueIndex("routine_run_dispositions_heartbeat_key_uq").on(
+      table.heartbeatRunId,
+      table.idempotencyKey,
+    ),
+    companyIssueIdx: index("routine_run_dispositions_company_issue_idx").on(
+      table.companyId,
+      table.issueId,
+      table.createdAt,
+    ),
+  }),
+);
