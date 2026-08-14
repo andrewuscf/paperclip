@@ -8,14 +8,19 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueThreadInteractions,
   issues,
+  projects,
   routineRunDispositions,
   routineRuns,
   routines,
 } from "@paperclipai/db";
-import type { ApplyRoutineRunDisposition } from "@paperclipai/shared";
+import { LOW_TRUST_REVIEW_PRESET, type ApplyRoutineRunDisposition } from "@paperclipai/shared";
 import { HttpError } from "../errors.js";
+import { agentService } from "../services/agents.js";
+import { companyService } from "../services/companies.js";
 import { routineRunDispositionService } from "../services/routine-run-dispositions.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -42,11 +47,13 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(routineRunDispositions);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(routineRuns);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
     await db.delete(routines);
+    await db.delete(projects);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -63,6 +70,7 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
     const routineRunId = randomUUID();
     const issueId = randomUUID();
     const heartbeatRunId = randomUUID();
+    const projectId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -88,9 +96,16 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
         adapterType: "codex_local",
       },
     ]);
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Disposition project",
+      status: "in_progress",
+    });
     await db.insert(routines).values({
       id: routineId,
       companyId,
+      projectId,
       title: "Deterministic automation",
       assigneeAgentId: actorAgentId,
       status: "active",
@@ -115,6 +130,7 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
     await db.insert(issues).values({
       id: issueId,
       companyId,
+      projectId,
       title: "Execute the deterministic routine",
       status: "in_progress",
       assigneeAgentId: actorAgentId,
@@ -132,7 +148,15 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
       .set({ linkedIssueId: issueId })
       .where(eq(routineRuns.id, routineRunId));
 
-    const actor = { companyId, agentId: actorAgentId, heartbeatRunId };
+    const actor = {
+      type: "agent" as const,
+      source: "agent_jwt" as const,
+      companyId,
+      agentId: actorAgentId,
+      runId: heartbeatRunId,
+      heartbeatRunId,
+      keyScope: { kind: "standard" as const },
+    };
     const request: ApplyRoutineRunDisposition = {
       idempotencyKey: `runner:${heartbeatRunId}:terminal`,
       expected: {
@@ -153,6 +177,7 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
       companyId,
       heartbeatRunId,
       issueId,
+      projectId,
       qaAgentId,
       request,
       routineId,
@@ -241,6 +266,47 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
     await expect(db.select().from(activityLog)).resolves.toHaveLength(3);
   });
 
+  it("keeps the receipt replayable after issue and run retention deletes", async () => {
+    const fixture = await seedFixture();
+    const svc = routineRunDispositionService(db);
+    const applied = await svc.apply(fixture.issueId, fixture.request, fixture.actor);
+
+    await db.delete(issueComments).where(eq(issueComments.issueId, fixture.issueId));
+    await db.delete(issues).where(eq(issues.id, fixture.issueId));
+    await db.delete(routineRuns).where(eq(routineRuns.id, fixture.routineRunId));
+    await expect(db.select().from(routineRunDispositions)).resolves.toMatchObject([{
+      issueId: fixture.issueId,
+      routineRunId: fixture.routineRunId,
+    }]);
+
+    const replay = await svc.apply(fixture.issueId, fixture.request, fixture.actor);
+    expect(replay).toMatchObject({ replayed: true, receipt: applied.receipt });
+
+    await db.delete(activityLog).where(eq(activityLog.runId, fixture.heartbeatRunId));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    await expect(db.select().from(routineRunDispositions)).resolves.toHaveLength(1);
+  });
+
+  it("allows actor and company cleanup without receipt foreign-key failures", async () => {
+    const fixture = await seedFixture();
+    await routineRunDispositionService(db).apply(fixture.issueId, fixture.request, fixture.actor);
+    await db.update(routines).set({ assigneeAgentId: fixture.qaAgentId })
+      .where(eq(routines.id, fixture.routineId));
+
+    await expect(agentService(db).remove(fixture.actorAgentId)).resolves.toMatchObject({
+      id: fixture.actorAgentId,
+    });
+    await expect(db.select().from(routineRunDispositions)).resolves.toMatchObject([{
+      actorAgentId: fixture.actorAgentId,
+      heartbeatRunId: fixture.heartbeatRunId,
+    }]);
+
+    await expect(companyService(db).remove(fixture.companyId)).resolves.toMatchObject({
+      id: fixture.companyId,
+    });
+    await expect(db.select().from(routineRunDispositions)).resolves.toHaveLength(0);
+  });
+
   it("reassigns a failed weekly execution to QA in the same transaction", async () => {
     const fixture = await seedFixture({ checkoutRunId: null });
     const request: ApplyRoutineRunDisposition = {
@@ -256,21 +322,128 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
 
     expect(result.receipt).toMatchObject({
       outcome: "escalated",
-      issueStatus: "in_review",
+      issueStatus: "blocked",
       issueAssigneeAgentId: fixture.qaAgentId,
       routineRunStatus: "failed",
     });
     await expect(db.select().from(issues).where(eq(issues.id, fixture.issueId))).resolves.toMatchObject([
       {
-        status: "in_review",
+        status: "blocked",
         assigneeAgentId: fixture.qaAgentId,
         checkoutRunId: null,
         executionRunId: null,
+        unblockDescriptor: {
+          owner: { agentId: fixture.qaAgentId },
+          action: "Review the routine execution failure and decide the recovery action.",
+        },
       },
     ]);
     await expect(db.select().from(routineRuns).where(eq(routineRuns.id, fixture.routineRunId))).resolves.toMatchObject([
       { status: "failed", failureReason: "weekly_qa_failed" },
     ]);
+
+    const replay = await routineRunDispositionService(db).apply(fixture.issueId, request, fixture.actor);
+    expect(replay).toMatchObject({ replayed: true, receipt: result.receipt });
+    await expect(db.select().from(issueComments)).resolves.toHaveLength(1);
+    await expect(db.select().from(routineRunDispositions)).resolves.toHaveLength(1);
+    await expect(db.select().from(activityLog)).resolves.toHaveLength(3);
+  });
+
+  it("denies a task-bridge review target outside its exact assignee scope without writes", async () => {
+    const fixture = await seedFixture();
+    const request: ApplyRoutineRunDisposition = {
+      ...fixture.request,
+      disposition: {
+        kind: "blocked",
+        comment: "This must not escape the bridge scope.",
+        failureReason: "command_failed",
+        assigneeAgentId: fixture.qaAgentId,
+        unblockAction: "Review the failure.",
+      },
+    };
+    const scopedActor = {
+      ...fixture.actor,
+      source: "agent_key" as const,
+      keyId: randomUUID(),
+      keyScope: {
+        kind: "task_bridge" as const,
+        projectId: fixture.projectId,
+        allowedAssigneeAgentIds: [],
+      },
+    };
+
+    await expect(routineRunDispositionService(db).apply(fixture.issueId, request, scopedActor))
+      .rejects.toMatchObject({ status: 403 });
+    await expectNoDispositionWrites();
+    await expect(db.select().from(issues).where(eq(issues.id, fixture.issueId))).resolves.toMatchObject([
+      { status: "in_progress", assigneeAgentId: fixture.actorAgentId },
+    ]);
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, fixture.routineRunId))).resolves.toMatchObject([
+      { status: "issue_created", completedAt: null },
+    ]);
+  });
+
+  it("persists low-trust output as quarantined and omits its activity snippet", async () => {
+    const fixture = await seedFixture();
+    await db.update(agents).set({
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: fixture.companyId,
+            projectIds: [fixture.projectId],
+            issueIds: [fixture.issueId],
+          },
+        },
+      },
+    }).where(eq(agents.id, fixture.actorAgentId));
+
+    await routineRunDispositionService(db).apply(fixture.issueId, fixture.request, fixture.actor);
+
+    const [comment] = await db.select().from(issueComments);
+    expect(comment?.sourceTrust).toMatchObject({
+      preset: LOW_TRUST_REVIEW_PRESET,
+      disposition: "quarantined",
+      sourceIssueId: fixture.issueId,
+      sourceRunId: fixture.heartbeatRunId,
+      sourceAgentId: fixture.actorAgentId,
+    });
+    const [commentActivity] = await db.select().from(activityLog)
+      .where(eq(activityLog.action, "issue.comment_added"));
+    expect(commentActivity?.details).toMatchObject({ bodyQuarantined: true });
+    expect(commentActivity?.details).not.toHaveProperty("bodySnippet");
+  });
+
+  it("fails closed when canonical execution policy routes completion into review", async () => {
+    const fixture = await seedFixture();
+    await db.update(issues).set({
+      executionPolicy: {
+        stages: [{
+          type: "review",
+          participants: [{ type: "agent", agentId: fixture.qaAgentId }],
+        }],
+      },
+    }).where(eq(issues.id, fixture.issueId));
+
+    await expect(routineRunDispositionService(db).apply(
+      fixture.issueId,
+      fixture.request,
+      fixture.actor,
+    )).rejects.toMatchObject({
+      status: 409,
+      details: { code: "routine_run_disposition_execution_policy_pending" },
+    });
+    await expectNoDispositionWrites();
+    await expect(db.select().from(issues).where(eq(issues.id, fixture.issueId))).resolves.toMatchObject([{
+      status: "in_progress",
+      assigneeAgentId: fixture.actorAgentId,
+      executionState: null,
+    }]);
+    await expect(db.select().from(routineRuns).where(eq(routineRuns.id, fixture.routineRunId))).resolves.toMatchObject([{
+      status: "issue_created",
+      completedAt: null,
+    }]);
   });
 
   it("blocks and hands failed work to an independent QA owner with an unblock descriptor", async () => {
@@ -477,14 +650,42 @@ describeEmbeddedPostgres("atomic routine run disposition service", () => {
 
   it("rolls back issue, comment, routine, activity, and receipt writes on a late failure", async () => {
     const fixture = await seedFixture();
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId: fixture.companyId,
+      issueId: fixture.issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Pick one",
+          selectionMode: "single",
+          options: [{ id: "a", label: "A" }],
+        }],
+      } as never,
+    });
+    const liveEvents: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(fixture.companyId, (event) => liveEvents.push(event));
     const svc = routineRunDispositionService(db, {
       beforeReceiptInsert: () => {
         throw new Error("injected receipt failure");
       },
     });
 
-    await expect(svc.apply(fixture.issueId, fixture.request, fixture.actor)).rejects.toThrow("injected receipt failure");
+    try {
+      await expect(svc.apply(fixture.issueId, fixture.request, fixture.actor))
+        .rejects.toThrow("injected receipt failure");
+    } finally {
+      unsubscribe();
+    }
     await expectNoDispositionWrites();
+    expect(liveEvents).toHaveLength(0);
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))
+      .resolves.toMatchObject([{ status: "pending", result: null }]);
     await expect(db.select().from(issues).where(eq(issues.id, fixture.issueId))).resolves.toMatchObject([
       {
         status: "in_progress",

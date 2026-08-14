@@ -116,6 +116,12 @@ describe("routine run disposition route", () => {
           requiresIndependentAssignee: true,
           requiresUnblockAction: true,
         },
+        escalated: {
+          issueStatus: "blocked",
+          routineRunStatus: "failed",
+          requiresIndependentAssignee: true,
+          durableReviewPath: "blocked_unblock_descriptor",
+        },
       },
       idempotency: {
         required: true,
@@ -124,11 +130,14 @@ describe("routine run disposition route", () => {
         mismatchStatus: 409,
       },
     });
-    expect(mockPreflight).toHaveBeenCalledWith(issueId, {
+    expect(mockPreflight).toHaveBeenCalledWith(issueId, expect.objectContaining({
       companyId,
       agentId,
       heartbeatRunId,
-    });
+      runId: heartbeatRunId,
+      type: "agent",
+      source: "agent_key",
+    }));
     expect(mockApply).not.toHaveBeenCalled();
     expect(mockPublishActivity).not.toHaveBeenCalled();
   });
@@ -177,10 +186,50 @@ describe("routine run disposition route", () => {
 
   it("binds service application to the authenticated company, agent, and heartbeat run", async () => {
     const publication = { companyId, payload: { action: "issue.updated" }, pluginEvent: null };
-    mockApply.mockResolvedValue({ receipt, replayed: false, activityPublications: [publication] });
+    mockApply.mockResolvedValue({
+      receipt,
+      replayed: false,
+      activityPublications: [publication],
+      postCommitCallbacks: [],
+    });
     const response = await request(createApp({
       type: "agent",
       source: "agent_key",
+      companyId,
+      agentId,
+      runId: heartbeatRunId,
+      keyId: "88888888-8888-4888-8888-888888888888",
+      keyScope: { kind: "standard" },
+    }))
+      .post(`/api/issues/${issueId}/runner-disposition`)
+      .send(payload);
+
+    expect(response.status).toBe(201);
+    expect(response.body).toEqual({ receipt, replayed: false });
+    expect(mockApply).toHaveBeenCalledWith(issueId, payload, expect.objectContaining({
+      companyId,
+      agentId,
+      heartbeatRunId,
+      runId: heartbeatRunId,
+      type: "agent",
+      keyId: "88888888-8888-4888-8888-888888888888",
+      keyScope: { kind: "standard" },
+    }));
+    expect(mockPublishActivity).toHaveBeenCalledWith(publication);
+  });
+
+  it("does not turn a committed disposition into a 500 when post-commit telemetry fails", async () => {
+    mockApply.mockResolvedValue({
+      receipt,
+      replayed: false,
+      activityPublications: [],
+      postCommitCallbacks: [vi.fn(async () => {
+        throw new Error("telemetry unavailable");
+      })],
+    });
+
+    const response = await request(createApp({
+      type: "agent",
       companyId,
       agentId,
       runId: heartbeatRunId,
@@ -190,16 +239,15 @@ describe("routine run disposition route", () => {
 
     expect(response.status).toBe(201);
     expect(response.body).toEqual({ receipt, replayed: false });
-    expect(mockApply).toHaveBeenCalledWith(issueId, payload, {
-      companyId,
-      agentId,
-      heartbeatRunId,
-    });
-    expect(mockPublishActivity).toHaveBeenCalledWith(publication);
   });
 
   it("returns a replay without publishing duplicate activity", async () => {
-    mockApply.mockResolvedValue({ receipt, replayed: true, activityPublications: [] });
+    mockApply.mockResolvedValue({
+      receipt,
+      replayed: true,
+      activityPublications: [],
+      postCommitCallbacks: [],
+    });
     const response = await request(createApp({
       type: "agent",
       companyId,

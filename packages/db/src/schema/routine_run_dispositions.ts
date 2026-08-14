@@ -1,9 +1,5 @@
 import { index, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
-import { agents } from "./agents.js";
 import { companies } from "./companies.js";
-import { heartbeatRuns } from "./heartbeat_runs.js";
-import { issues } from "./issues.js";
-import { routineRuns } from "./routines.js";
 
 export type RoutineRunDispositionReceipt = {
   id: string;
@@ -14,7 +10,7 @@ export type RoutineRunDispositionReceipt = {
   heartbeatRunId: string;
   actorAgentId: string;
   outcome: "completed" | "blocked" | "escalated";
-  issueStatus: "done" | "blocked" | "in_review";
+  issueStatus: "done" | "blocked";
   issueAssigneeAgentId: string | null;
   routineRunStatus: "completed" | "failed";
   commentId: string;
@@ -27,10 +23,15 @@ export const routineRunDispositions = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
-    routineRunId: uuid("routine_run_id").notNull().references(() => routineRuns.id, { onDelete: "cascade" }),
-    issueId: uuid("issue_id").notNull().references(() => issues.id, { onDelete: "cascade" }),
-    heartbeatRunId: uuid("heartbeat_run_id").notNull().references(() => heartbeatRuns.id, { onDelete: "restrict" }),
-    actorAgentId: uuid("actor_agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
+    // These identifiers intentionally remain immutable audit references rather
+    // than lifecycle foreign keys. Agents and heartbeat runs are routinely
+    // pruned, and issues/routine runs may be removed by retention. Cascading
+    // would destroy the receipt while RESTRICT would make ordinary lifecycle
+    // cleanup fail. The receipt JSON is the durable terminal snapshot.
+    routineRunId: uuid("routine_run_id").notNull(),
+    issueId: uuid("issue_id").notNull(),
+    heartbeatRunId: uuid("heartbeat_run_id").notNull(),
+    actorAgentId: uuid("actor_agent_id").notNull(),
     idempotencyKey: text("idempotency_key").notNull(),
     requestSha256: text("request_sha256").notNull(),
     receipt: jsonb("receipt").$type<RoutineRunDispositionReceipt>().notNull(),

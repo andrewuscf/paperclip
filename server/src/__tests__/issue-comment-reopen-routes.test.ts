@@ -2308,6 +2308,7 @@ describe.sequential("issue comment reopen routes", () => {
       }),
       mockTx,
       expect.any(Array),
+      expect.any(Array),
     );
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
     const decisionId = updatePatch.executionState.lastDecisionId;
@@ -2403,6 +2404,8 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
       mockTx,
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -2488,6 +2491,8 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       }),
       mockTx,
+      expect.any(Array),
+      expect.any(Array),
     );
   });
 
@@ -3097,6 +3102,8 @@ describe.sequential("issue comment reopen routes", () => {
         "11111111-1111-4111-8111-111111111111",
         expect.objectContaining({ status: "done" }),
         mockTx,
+        expect.any(Array),
+        expect.any(Array),
       );
       expect(mockLogActivity).toHaveBeenCalledWith(
         expect.anything(),
@@ -3178,6 +3185,8 @@ describe.sequential("issue comment reopen routes", () => {
       expect.objectContaining({ agentId: reviewerAgentId }),
       expect.any(Object),
       mockTx,
+      expect.any(Array),
+      expect.any(Array),
     );
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -3248,6 +3257,8 @@ describe.sequential("issue comment reopen routes", () => {
       expect.objectContaining({ agentId: reviewerAgentId }),
       expect.any(Object),
       mockTx,
+      expect.any(Array),
+      expect.any(Array),
     );
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, or } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import type { Db, RoutineRunDispositionReceipt } from "@paperclipai/db";
 import {
   heartbeatRuns,
@@ -8,17 +8,32 @@ import {
   routineRuns,
 } from "@paperclipai/db";
 import type { ApplyRoutineRunDisposition } from "@paperclipai/shared";
-import { conflict, HttpError } from "../errors.js";
+import { conflict, forbidden, HttpError } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import {
   persistActivity,
   type ActivityPublication,
 } from "./activity-log.js";
+import {
+  authorizationDeniedDetails,
+  authorizationService,
+  type AuthorizationActor,
+} from "./authorization.js";
+import {
+  applyIssueExecutionPolicyTransition,
+  normalizeIssueExecutionPolicy,
+} from "./issue-execution-policy.js";
 import { issueService } from "./issues.js";
+import {
+  isLowTrustQuarantined,
+  resolveActorSourceTrustForIssue,
+} from "./source-trust.js";
 
-type RoutineRunDispositionActor = {
+export type RoutineRunDispositionActor = AuthorizationActor & {
+  type: "agent";
   companyId: string;
   agentId: string;
+  runId: string;
   heartbeatRunId: string;
 };
 
@@ -32,6 +47,7 @@ type RoutineRunDispositionResult = {
   receipt: RoutineRunDispositionReceipt;
   replayed: boolean;
   activityPublications: ActivityPublication[];
+  postCommitCallbacks: Array<() => void | Promise<void>>;
 };
 
 type BoundDispositionState = {
@@ -55,7 +71,22 @@ function dispositionRequestSha256(input: {
   actor: RoutineRunDispositionActor;
   request: ApplyRoutineRunDisposition;
 }) {
-  return createHash("sha256").update(canonicalJson(input)).digest("hex");
+  // Bind idempotency to the authenticated principal and credential scope, but
+  // not to request-local membership caches that middleware may hydrate.
+  const actorBinding = {
+    type: input.actor.type,
+    companyId: input.actor.companyId,
+    agentId: input.actor.agentId,
+    runId: input.actor.runId,
+    heartbeatRunId: input.actor.heartbeatRunId,
+    source: input.actor.source ?? null,
+    keyId: input.actor.keyId ?? null,
+    keyScope: input.actor.keyScope ?? null,
+    onBehalfOfUserId: input.actor.onBehalfOfUserId ?? null,
+  };
+  return createHash("sha256")
+    .update(canonicalJson({ issueId: input.issueId, actor: actorBinding, request: input.request }))
+    .digest("hex");
 }
 
 function readContextIssueIds(contextSnapshot: Record<string, unknown> | null) {
@@ -213,6 +244,7 @@ export function routineRunDispositionService(
           receipt: assertReplayMatches(replayByKey, { issueId, actor, request, requestSha256 }),
           replayed: true,
           activityPublications: [],
+          postCommitCallbacks: [],
         };
       }
 
@@ -251,6 +283,7 @@ export function routineRunDispositionService(
           receipt: assertReplayMatches(replayByRoutineRun, { issueId, actor, request, requestSha256 }),
           replayed: true,
           activityPublications: [],
+          postCommitCallbacks: [],
         };
       }
 
@@ -279,11 +312,12 @@ export function routineRunDispositionService(
       if (issue.executionRunId !== request.expected.executionRunId) {
         throw preconditionConflict("issue.executionRunId", request.expected.executionRunId, issue.executionRunId);
       }
+      // An escalation without a durable review wake can strand an in_review
+      // issue forever. Keep both failure dispositions in the canonical blocked
+      // workflow, with an explicit independent owner and recovery action.
       const nextIssueStatus = request.disposition.kind === "completed"
         ? "done" as const
-        : request.disposition.kind === "blocked"
-          ? "blocked" as const
-          : "in_review" as const;
+        : "blocked" as const;
       const nextRoutineRunStatus = request.disposition.kind === "completed"
         ? "completed" as const
         : "failed" as const;
@@ -304,26 +338,101 @@ export function routineRunDispositionService(
             "not_assignable",
           );
         }
+
+        const assignmentDecision = await authorizationService(txDb).decide({
+          actor,
+          action: "tasks:assign",
+          resource: {
+            type: "issue",
+            companyId: issue.companyId,
+            issueId: issue.id,
+            projectId: issue.projectId,
+            parentIssueId: issue.parentId,
+            assigneeAgentId: nextAssigneeAgentId,
+            assigneeUserId: null,
+            originKind: issue.originKind,
+            originId: issue.originId,
+            status: nextIssueStatus,
+          },
+        });
+        if (!assignmentDecision.allowed) {
+          throw forbidden(
+            assignmentDecision.explanation,
+            authorizationDeniedDetails(assignmentDecision),
+          );
+        }
       }
 
+      const sourceTrust = await resolveActorSourceTrustForIssue({
+        db: txDb,
+        issue,
+        actor: {
+          actorType: "agent",
+          actorId: actor.agentId,
+          agentId: actor.agentId,
+          runId: actor.heartbeatRunId,
+        },
+      });
+      const activityPublications: ActivityPublication[] = [];
+      const postCommitCallbacks: Array<() => void | Promise<void>> = [];
+      let canonicalTransitionPatch: Record<string, unknown> = {};
+      if (request.disposition.kind === "completed") {
+        const transition = applyIssueExecutionPolicyTransition({
+          issue,
+          policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
+          requestedStatus: "done",
+          requestedAssigneePatch: {},
+          actor: { agentId: actor.agentId, userId: null },
+          commentBody: request.disposition.comment,
+        });
+        if (transition.decision) {
+          throw conflict("Routine completion cannot author an execution-policy decision", {
+            code: "routine_run_disposition_execution_policy_decision_required",
+            issueId: issue.id,
+            stageId: transition.decision.stageId,
+            outcome: transition.decision.outcome,
+          });
+        }
+        const canonicalStatus = typeof transition.patch.status === "string"
+          ? transition.patch.status
+          : "done";
+        if (canonicalStatus !== "done") {
+          throw conflict("Routine completion requires the issue execution workflow to be terminal", {
+            code: "routine_run_disposition_execution_policy_pending",
+            issueId: issue.id,
+            requestedStatus: "done",
+            canonicalStatus,
+          });
+        }
+        canonicalTransitionPatch = transition.patch;
+      }
+
+      const unblockAction = request.disposition.kind === "blocked"
+        ? request.disposition.unblockAction
+        : request.disposition.kind === "escalated"
+          ? "Review the routine execution failure and decide the recovery action."
+          : null;
       const updatedIssue = await issueSvc.update(
         issue.id,
         {
+          ...canonicalTransitionPatch,
           status: nextIssueStatus,
           ...(request.disposition.kind === "escalated" || request.disposition.kind === "blocked"
             ? { assigneeAgentId: request.disposition.assigneeAgentId }
             : {}),
-          ...(request.disposition.kind === "blocked"
+          ...(unblockAction
             ? {
                 unblockDescriptor: {
-                  owner: { agentId: request.disposition.assigneeAgentId },
-                  action: request.disposition.unblockAction,
+                  owner: { agentId: nextAssigneeAgentId! },
+                  action: unblockAction,
                 },
               }
             : {}),
           actorAgentId: actor.agentId,
         },
         txDb,
+        activityPublications,
+        postCommitCallbacks,
       );
       if (!updatedIssue) throw preconditionConflict("issueId", issue.id, null);
 
@@ -331,8 +440,13 @@ export function routineRunDispositionService(
         issue.id,
         request.disposition.comment,
         { agentId: actor.agentId, runId: actor.heartbeatRunId },
-        { authorizationReason: "routine_run_disposition" },
+        {
+          authorizationReason: "routine_run_disposition",
+          sourceTrust,
+        },
         txDb,
+        activityPublications,
+        postCommitCallbacks,
       );
       const now = new Date();
       const updatedRoutineRun = await txDb
@@ -356,7 +470,6 @@ export function routineRunDispositionService(
         throw preconditionConflict("routineRun.status", "issue_created", "changed");
       }
 
-      const activityPublications: ActivityPublication[] = [];
       const activityBase = {
         companyId: issue.companyId,
         actorType: "agent" as const,
@@ -390,7 +503,9 @@ export function routineRunDispositionService(
         details: {
           identifier: issue.identifier,
           commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
+          ...(isLowTrustQuarantined(sourceTrust)
+            ? { bodyQuarantined: true }
+            : { bodySnippet: comment.body.slice(0, 120) }),
           authorizationReason: "routine_run_disposition",
         },
       })).publication);
@@ -440,7 +555,7 @@ export function routineRunDispositionService(
         createdAt: now,
       });
 
-      return { receipt, replayed: false, activityPublications };
+      return { receipt, replayed: false, activityPublications, postCommitCallbacks };
     });
   }
 

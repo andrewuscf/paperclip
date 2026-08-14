@@ -406,6 +406,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
 
     try {
       const postCommitActivityPublications: ActivityPublication[] = [];
+      const postCommitCallbacks: Array<() => void | Promise<void>> = [];
       const executionResult = await db.transaction(async (tx) => {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
         let execution = await tx.select().from(decisionEffectExecutions).where(and(eq(decisionEffectExecutions.decisionId, decision.id), eq(decisionEffectExecutions.effectIndex, effectIndex)))
@@ -464,7 +465,15 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         const values = decision.inputValues ?? {};
         let result: Record<string, unknown>;
         if (effect.type === "comment_on_issue") {
-          const comment = await svc.addComment(target.id, interpolate(effect.bodyMarkdown, values), { userId: decidedByUserId }, undefined, tx);
+          const comment = await svc.addComment(
+            target.id,
+            interpolate(effect.bodyMarkdown, values),
+            { userId: decidedByUserId },
+            undefined,
+            tx,
+            postCommitActivityPublications,
+            postCommitCallbacks,
+          );
           result = { commentId: comment.id };
         } else if (effect.type === "update_issue_status") {
           const updated = await svc.update(
@@ -472,8 +481,19 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             { status: effect.status, actorUserId: decidedByUserId },
             tx,
             postCommitActivityPublications,
+            postCommitCallbacks,
           );
-          if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
+          if (effect.comment) {
+            await svc.addComment(
+              target.id,
+              interpolate(effect.comment, values),
+              { userId: decidedByUserId },
+              undefined,
+              tx,
+              postCommitActivityPublications,
+              postCommitCallbacks,
+            );
+          }
           result = { issueId: updated?.id, status: updated?.status };
         } else if (effect.type === "assign_issue") {
           const updated = await svc.update(
@@ -485,8 +505,19 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             },
             tx,
             postCommitActivityPublications,
+            postCommitCallbacks,
           );
-          if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
+          if (effect.comment) {
+            await svc.addComment(
+              target.id,
+              interpolate(effect.comment, values),
+              { userId: decidedByUserId },
+              undefined,
+              tx,
+              postCommitActivityPublications,
+              postCommitCallbacks,
+            );
+          }
           result = { issueId: updated?.id };
         } else if (effect.type === "resolve_blocker") {
           const current = await tx.select({ id: issueRelations.issueId }).from(issueRelations).where(and(eq(issueRelations.companyId, decision.companyId), eq(issueRelations.relatedIssueId, target.id), eq(issueRelations.type, "blocks")));
@@ -498,6 +529,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             },
             tx,
             postCommitActivityPublications,
+            postCommitCallbacks,
           );
           result = { removedBlockedByIssueIds: effect.removeBlockedByIssueIds };
         } else if (effect.type === "create_issue") {
@@ -505,7 +537,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           const created = await svc.create(decision.companyId, { title: draft.title, description: draft.description ?? null, parentId: draft.parentId ?? target.id,
             assigneeAgentId: draft.assigneeAgentId ?? null, assigneeUserId: draft.assigneeUserId ?? null, projectId: draft.projectId ?? target.projectId,
             goalId: draft.goalId ?? null, blockedByIssueIds: draft.blockedByIssueIds ?? [], createdByUserId: decidedByUserId, actorRunId: decision.originRunId,
-            idempotencyKey: `decision-effect:${decision.id}:${effectIndex}` });
+            idempotencyKey: `decision-effect:${decision.id}:${effectIndex}` }, tx);
           result = { issueId: created.id };
         } else {
           const cancelled = [target.id, ...cancellationDescendantIds!].reverse();
@@ -515,9 +547,18 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
               { status: "cancelled", actorUserId: decidedByUserId },
               tx,
               postCommitActivityPublications,
+              postCommitCallbacks,
             );
           }
-          await svc.addComment(target.id, interpolate(effect.reasonComment, values), { userId: decidedByUserId }, undefined, tx);
+          await svc.addComment(
+            target.id,
+            interpolate(effect.reasonComment, values),
+            { userId: decidedByUserId },
+            undefined,
+            tx,
+            postCommitActivityPublications,
+            postCommitCallbacks,
+          );
           result = { cancelledIssueIds: cancelled };
         }
         const activity = await effectAudit(tx as unknown as Db, decision, execution.id, effect, "executed", decidedByUserId, originResponsibleUserId, result);
@@ -525,6 +566,13 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         return row;
       });
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      for (const callback of postCommitCallbacks) {
+        try {
+          await callback();
+        } catch {
+          // The decision effect and its audit rows are already committed.
+        }
+      }
       return executionResult;
     } catch (error) {
       const message = error instanceof Error ? error.message : "Decision effect execution failed";

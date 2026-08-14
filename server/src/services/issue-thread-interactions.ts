@@ -804,6 +804,27 @@ async function emitResolvedInteractionsTelemetry(
   ));
 }
 
+async function enqueueResolvedInteractionsTelemetry(
+  db: Pick<Db, "select">,
+  interactions: readonly IssueThreadInteraction[],
+  postCommitCallbacks: Array<() => void | Promise<void>>,
+) {
+  if (interactions.length === 0 || !getTelemetryClient()) return;
+  let roleByAgentId = new Map<string, string | null>();
+  try {
+    // Resolve database-backed dimensions while the caller-owned transaction
+    // is alive. The callback must not reuse a transaction handle after commit.
+    roleByAgentId = await fetchCreatorAgentRoleById(db, interactions);
+  } catch (error) {
+    console.error("[paperclip] Failed to load interaction.resolved creator roles", error);
+  }
+  postCommitCallbacks.push(async () => {
+    await Promise.all(interactions.map((interaction) =>
+      emitInteractionResolvedTelemetry(db, interaction, { creatorRoleByAgentId: roleByAgentId })
+    ));
+  });
+}
+
 function isCommentAtOrAfterInteraction(args: {
   commentCreatedAt: Date | string;
   interactionCreatedAt: Date | string;
@@ -2381,6 +2402,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       issue: { id: string; companyId: string; status?: string },
       comment: { id: string; createdAt: Date | string; authorUserId?: string | null; createdByRunId?: string | null },
       actor: InteractionActor,
+      postCommitCallbacks?: Array<() => void | Promise<void>>,
     ) => {
       if (!comment.authorUserId) return [];
       // Local-CLI adapters post under user auth, so authorUserId can't tell a human from a
@@ -2434,7 +2456,11 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
 
       if (expired.length > 0) {
         await touchIssue(db, issue.id);
-        await emitResolvedInteractionsTelemetry(db, expired);
+        if (postCommitCallbacks) {
+          await enqueueResolvedInteractionsTelemetry(db, expired, postCommitCallbacks);
+        } else {
+          await emitResolvedInteractionsTelemetry(db, expired);
+        }
       }
       return expired;
     },
@@ -2656,6 +2682,7 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
     expirePendingInteractionsForTerminalIssue: async (
       issue: { id: string; companyId: string; status: string },
       actor: InteractionActor = {},
+      postCommitCallbacks?: Array<() => void | Promise<void>>,
     ) => {
       if (!isTerminalIssueStatus(issue.status)) return [];
       const rows = await db
@@ -2711,7 +2738,14 @@ export function issueThreadInteractionService(db: Db, opts: IssueThreadInteracti
       }
       if (expired.length > 0) {
         await touchIssue(db, issue.id);
-        await emitResolvedInteractionsTelemetry(db, expired);
+        if (postCommitCallbacks) {
+          // This method is also called from issueService.update() while its
+          // outer transaction is still open. Telemetry is an external side
+          // effect and must not report a resolution that later rolls back.
+          await enqueueResolvedInteractionsTelemetry(db, expired, postCommitCallbacks);
+        } else {
+          await emitResolvedInteractionsTelemetry(db, expired);
+        }
       }
       return expired;
     },

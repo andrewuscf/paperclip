@@ -4,6 +4,7 @@ import type { Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { setupLiveEventsWebSocketServer } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
+import { publishLiveEvent, subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 vi.mock("../middleware/logger.js", () => ({
   logger: {
@@ -119,5 +120,36 @@ describe("setupLiveEventsWebSocketServer", () => {
     expect(socket.listenerCount("error")).toBe(0);
     expect(socket.listenerCount("close")).toBe(0);
     expect(socket.listenerCount("finish")).toBe(0);
+  });
+
+  it("isolates a throwing subscriber so committed events reach later listeners", () => {
+    const companyId = "subscriber-isolation-company";
+    const received: unknown[] = [];
+    const unsubscribeThrowing = subscribeCompanyLiveEvents(companyId, () => {
+      throw new Error("subscriber failed");
+    });
+    const unsubscribeHealthy = subscribeCompanyLiveEvents(companyId, (event) => {
+      received.push(event);
+    });
+
+    try {
+      expect(() => publishLiveEvent({
+        companyId,
+        type: "activity.logged",
+        payload: { action: "routine.run_skipped" },
+      })).not.toThrow();
+      expect(received).toMatchObject([{
+        companyId,
+        type: "activity.logged",
+        payload: { action: "routine.run_skipped" },
+      }]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error), companyId }),
+        "live-event subscriber failed",
+      );
+    } finally {
+      unsubscribeThrowing();
+      unsubscribeHealthy();
+    }
   });
 });

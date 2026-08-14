@@ -13305,6 +13305,95 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  async function wakeupInTransaction(
+    agentId: string,
+    opts: {
+      companyId: string;
+      responsibleUserId: string | null;
+      source: "timer" | "assignment" | "on_demand" | "automation";
+      triggerDetail: "manual" | "ping" | "callback" | "system";
+      reason: string;
+      payload: Record<string, unknown>;
+      contextSnapshot: Record<string, unknown>;
+      requestedByActorType?: "user" | "agent" | "system";
+      requestedByActorId?: string | null;
+      idempotencyKey: string;
+    },
+    executor: Db,
+  ) {
+    const agent = await executor
+      .select({ id: agents.id, companyId: agents.companyId })
+      .from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.companyId, opts.companyId)))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!agent) throw notFound("Agent not found");
+
+    const existingRequest = await executor
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(
+        eq(agentWakeupRequests.companyId, opts.companyId),
+        eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+      ))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (existingRequest) {
+      if (
+        existingRequest.agentId !== agentId ||
+        existingRequest.source !== opts.source ||
+        existingRequest.reason !== opts.reason ||
+        JSON.stringify(existingRequest.payload ?? null) !== JSON.stringify(opts.payload)
+      ) {
+        throw conflict("Transactional wakeup idempotency key already has different bindings");
+      }
+      if (!existingRequest.runId) {
+        throw conflict("Transactional wakeup receipt is incomplete");
+      }
+      return executor
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, existingRequest.runId))
+        .then((rows) => rows[0] ?? null);
+    }
+
+    const wakeupRequest = await executor
+      .insert(agentWakeupRequests)
+      .values({
+        companyId: opts.companyId,
+        agentId,
+        source: opts.source,
+        triggerDetail: opts.triggerDetail,
+        reason: opts.reason,
+        payload: opts.payload,
+        status: "queued",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: opts.idempotencyKey,
+      })
+      .returning()
+      .then((rows) => rows[0]);
+    const run = await executor
+      .insert(heartbeatRuns)
+      .values({
+        companyId: opts.companyId,
+        agentId,
+        invocationSource: opts.source,
+        triggerDetail: opts.triggerDetail,
+        status: "queued",
+        responsibleUserId: opts.responsibleUserId,
+        wakeupRequestId: wakeupRequest.id,
+        contextSnapshot: opts.contextSnapshot,
+      })
+      .returning()
+      .then((rows) => rows[0]);
+    await executor
+      .update(agentWakeupRequests)
+      .set({ runId: run.id, updatedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+    return run;
+  }
+
   async function reconcileStrandedAssignedIssues() {
     return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -18969,6 +19058,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    wakeupInTransaction,
 
     scheduleBoundedRetry: async (
       runId: string,

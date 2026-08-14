@@ -4758,8 +4758,8 @@ export function issueService(db: Db) {
     });
   }
 
-  async function assertAssignableUser(companyId: string, userId: string) {
-    const membership = await db
+  async function assertAssignableUser(companyId: string, userId: string, dbOrTx: DbReader = db) {
+    const membership = await dbOrTx
       .select({ id: companyMemberships.id })
       .from(companyMemberships)
       .where(
@@ -6870,7 +6870,7 @@ export function issueService(db: Db) {
       });
     },
 
-    create: async (companyId: string, data: IssueCreateInput) => {
+    create: async (companyId: string, data: IssueCreateInput, dbOrTx: any = db) => {
       const {
         labelIds: inputLabelIds,
         blockedByIssueIds,
@@ -6896,15 +6896,15 @@ export function issueService(db: Db) {
         throw unprocessable("Issue can only have one assignee");
       }
       if (data.assigneeAgentId) {
-        await assertAssignableAgent(db, companyId, data.assigneeAgentId, { kind: "work" });
+        await assertAssignableAgent(dbOrTx as Db, companyId, data.assigneeAgentId, { kind: "work" });
       }
       if (data.assigneeUserId) {
-        await assertAssignableUser(companyId, data.assigneeUserId);
+        await assertAssignableUser(companyId, data.assigneeUserId, dbOrTx);
       }
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      return db.transaction(async (tx) => {
+      const runCreate = async (tx: Db) => {
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
         const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
         if (allowDuplicate === false) {
@@ -7195,7 +7195,10 @@ export function issueService(db: Db) {
         const [enriched] = await withIssueLabels(tx, [issue]);
         const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
         return withRelations;
-      });
+      };
+      return dbOrTx === db
+        ? db.transaction((tx) => runCreate(tx as unknown as Db))
+        : runCreate(dbOrTx as Db);
     },
 
     /**
@@ -7475,9 +7478,12 @@ export function issueService(db: Db) {
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
+      postCommitCallbacks?: Array<() => void | Promise<void>>,
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications = postCommitActivityPublications ?? ownedActivityPublications;
+      const ownedPostCommitCallbacks: Array<() => void | Promise<void>> = [];
+      const callbacks = postCommitCallbacks ?? ownedPostCommitCallbacks;
       const existing = await dbOrTx
         .select()
         .from(issues)
@@ -7709,7 +7715,7 @@ export function issueService(db: Db) {
                   nextIssueStatus: updated.status,
                   workspaceAction: "left_archived",
                 },
-              });
+              }, activityPublications);
             }
           }
           if (updated.status === "done" || updated.status === "cancelled") {
@@ -7723,6 +7729,7 @@ export function issueService(db: Db) {
             const expiredInteractions = await issueThreadInteractionService(tx).expirePendingInteractionsForTerminalIssue(
               updated,
               { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+              callbacks,
             );
             for (const interaction of expiredInteractions) {
               await logActivity(tx as unknown as Db, {
@@ -7741,7 +7748,7 @@ export function issueService(db: Db) {
                   source: "issue.status_transition.issue_closed",
                   result: interaction.result ?? null,
                 },
-              });
+              }, activityPublications);
             }
           }
           // A status-card generation task that goes done/cancelled/blocked stops
@@ -7883,8 +7890,17 @@ export function issueService(db: Db) {
       };
 
       const result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
+      if (dbOrTx !== db && !postCommitActivityPublications && ownedActivityPublications.length > 0) {
+        throw new Error("Issue update in an external transaction requires a post-commit activity queue");
+      }
+      if (dbOrTx !== db && !postCommitCallbacks && ownedPostCommitCallbacks.length > 0) {
+        throw new Error("Issue update in an external transaction requires a post-commit callback queue");
+      }
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications) publishActivity(publication);
+      }
+      if (dbOrTx === db && !postCommitCallbacks) {
+        for (const callback of ownedPostCommitCallbacks) await callback();
       }
       return result;
     },
@@ -8628,7 +8644,13 @@ export function issueService(db: Db) {
         createdAt?: Date | string | null;
       },
       dbOrTx: any = db,
+      postCommitActivityPublications?: ActivityPublication[],
+      postCommitCallbacks?: Array<() => void | Promise<void>>,
     ) => {
+      const ownedActivityPublications: ActivityPublication[] = [];
+      const activityPublications = postCommitActivityPublications ?? ownedActivityPublications;
+      const ownedPostCommitCallbacks: Array<() => void | Promise<void>> = [];
+      const callbacks = postCommitCallbacks ?? ownedPostCommitCallbacks;
       const issue = await dbOrTx
         .select({ companyId: issues.companyId })
         .from(issues)
@@ -8704,6 +8726,7 @@ export function issueService(db: Db) {
             { id: issueId, companyId: issue.companyId },
             comment,
             { agentId: actor.agentId, userId: actor.userId },
+            callbacks,
           );
         for (const interaction of expiredInteractions) {
           await logActivity(dbOrTx, {
@@ -8722,8 +8745,21 @@ export function issueService(db: Db) {
               source: "issue.comment.service",
               result: interaction.result ?? null,
             },
-          });
+          }, activityPublications);
         }
+      }
+
+      if (dbOrTx !== db && !postCommitActivityPublications && ownedActivityPublications.length > 0) {
+        throw new Error("Issue comment in an external transaction requires a post-commit activity queue");
+      }
+      if (dbOrTx !== db && !postCommitCallbacks && ownedPostCommitCallbacks.length > 0) {
+        throw new Error("Issue comment in an external transaction requires a post-commit callback queue");
+      }
+      if (dbOrTx === db && !postCommitActivityPublications) {
+        for (const publication of ownedActivityPublications) publishActivity(publication);
+      }
+      if (dbOrTx === db && !postCommitCallbacks) {
+        for (const callback of ownedPostCommitCallbacks) await callback();
       }
 
       return redactIssueComment(comment, currentUserRedactionOptions.enabled);

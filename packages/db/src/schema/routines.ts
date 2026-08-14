@@ -10,6 +10,7 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { agents } from "./agents.js";
 import { companies } from "./companies.js";
 import { companySecrets } from "./company_secrets.js";
@@ -171,6 +172,8 @@ export const routineRuns = pgTable(
     triggerIdx: index("routine_runs_trigger_idx").on(table.triggerId, table.createdAt),
     dispatchFingerprintIdx: index("routine_runs_dispatch_fingerprint_idx").on(table.routineId, table.dispatchFingerprint),
     linkedIssueIdx: index("routine_runs_linked_issue_idx").on(table.linkedIssueId),
-    idempotencyIdx: index("routine_runs_trigger_idempotency_idx").on(table.triggerId, table.idempotencyKey),
+    idempotencyUq: uniqueIndex("routine_runs_trigger_idempotency_uq")
+      .on(table.triggerId, table.idempotencyKey)
+      .where(sql`${table.triggerId} IS NOT NULL AND ${table.idempotencyKey} IS NOT NULL`),
   }),
 );

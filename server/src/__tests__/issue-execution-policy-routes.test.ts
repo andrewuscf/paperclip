@@ -381,6 +381,8 @@ describe("issue execution policy routes", () => {
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.not.objectContaining({ reviewInteractionId: expect.anything() }),
       expect.anything(),
+      expect.any(Array),
+      expect.any(Array),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),

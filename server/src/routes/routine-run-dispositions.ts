@@ -18,8 +18,11 @@ function requireRunBoundActor(actor: Express.Request["actor"]) {
     throw forbidden("A run-bound agent is required");
   }
   return {
+    ...actor,
+    type: "agent" as const,
     companyId: actor.companyId,
     agentId: actor.agentId,
+    runId: actor.runId,
     heartbeatRunId: actor.runId,
   };
 }
@@ -37,7 +40,11 @@ export function routineRunDispositionRoutes(db: Db) {
         method: "POST",
         path: `/api/issues/${req.params.issueId as string}/runner-disposition`,
       },
-      actorBinding: actor,
+      actorBinding: {
+        companyId: actor.companyId,
+        agentId: actor.agentId,
+        heartbeatRunId: actor.heartbeatRunId,
+      },
       expected: preflight.expected,
       dispositions: {
         completed: {
@@ -51,9 +58,10 @@ export function routineRunDispositionRoutes(db: Db) {
           requiresUnblockAction: true,
         },
         escalated: {
-          issueStatus: "in_review",
+          issueStatus: "blocked",
           routineRunStatus: "failed",
           requiresIndependentAssignee: true,
+          durableReviewPath: "blocked_unblock_descriptor",
         },
       },
       idempotency: {
@@ -77,6 +85,15 @@ export function routineRunDispositionRoutes(db: Db) {
         actor,
       );
       for (const publication of result.activityPublications) publishActivity(publication);
+      for (const callback of result.postCommitCallbacks ?? []) {
+        try {
+          await callback();
+        } catch {
+          // The mutation and its activity rows are already durable. Optional
+          // post-commit telemetry may be retried independently and must never
+          // turn a committed disposition into an HTTP failure.
+        }
+      }
       res.status(result.replayed ? 200 : 201).json({
         receipt: result.receipt,
         replayed: result.replayed,

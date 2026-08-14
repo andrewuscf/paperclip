@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -19,6 +20,8 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
+import { issueService } from "../services/issues.js";
+import type { ActivityPublication } from "../services/activity-log.js";
 
 const telemetryMocks = vi.hoisted(() => ({
   track: vi.fn(),
@@ -52,6 +55,7 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
   });
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(issueDocuments);
@@ -125,6 +129,141 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
     const calls = telemetryMocks.track.mock.calls.filter((call) => call[0] === "interaction.resolved");
     return calls.at(-1)?.[1] as Record<string, unknown>;
   }
+
+  it("defers terminal interaction activity and telemetry until the outer transaction commits", async () => {
+    const { companyId, issueId } = await seedIssue("Terminal transaction boundary");
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Pick one",
+          selectionMode: "single",
+          options: [{ id: "a", label: "A" }],
+        }],
+      } as never,
+    });
+    const svc = issueService(db);
+    const rollbackPublications: ActivityPublication[] = [];
+    const rollbackCallbacks: Array<() => void | Promise<void>> = [];
+
+    await expect(db.transaction(async (tx) => {
+      await svc.update(
+        issueId,
+        { status: "cancelled", actorUserId: "local-board" },
+        tx,
+        rollbackPublications,
+        rollbackCallbacks,
+      );
+      throw new Error("force rollback");
+    })).rejects.toThrow("force rollback");
+
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))
+      .resolves.toMatchObject([{ status: "pending", result: null }]);
+    await expect(db.select().from(activityLog)).resolves.toHaveLength(0);
+    expect(telemetryMocks.track).not.toHaveBeenCalled();
+
+    const publications: ActivityPublication[] = [];
+    const callbacks: Array<() => void | Promise<void>> = [];
+    await db.transaction(async (tx) => {
+      await svc.update(
+        issueId,
+        { status: "cancelled", actorUserId: "local-board" },
+        tx,
+        publications,
+        callbacks,
+      );
+    });
+    expect(callbacks).toHaveLength(1);
+    expect(telemetryMocks.track).not.toHaveBeenCalled();
+    for (const callback of callbacks) await callback();
+
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))
+      .resolves.toMatchObject([{ status: "expired" }]);
+    await expect(db.select().from(activityLog).where(eq(activityLog.action, "issue.thread_interaction_expired")))
+      .resolves.toHaveLength(1);
+    expect(publications).toHaveLength(1);
+    expect(telemetryMocks.track.mock.calls.filter((call) => call[0] === "interaction.resolved"))
+      .toHaveLength(1);
+  });
+
+  it("defers comment-superseded interaction activity and telemetry until commit", async () => {
+    const { companyId, issueId } = await seedIssue("Comment transaction boundary");
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        supersedeOnUserComment: true,
+        questions: [{
+          id: "scope",
+          prompt: "Pick one",
+          selectionMode: "single",
+          options: [{ id: "a", label: "A" }],
+        }],
+      } as never,
+    });
+    const svc = issueService(db);
+    const rollbackPublications: ActivityPublication[] = [];
+    const rollbackCallbacks: Array<() => void | Promise<void>> = [];
+
+    await expect(db.transaction(async (tx) => {
+      await svc.addComment(
+        issueId,
+        "Use option A",
+        { userId: "local-board" },
+        undefined,
+        tx,
+        rollbackPublications,
+        rollbackCallbacks,
+      );
+      throw new Error("force rollback");
+    })).rejects.toThrow("force rollback");
+
+    await expect(db.select().from(issueComments)).resolves.toHaveLength(0);
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))
+      .resolves.toMatchObject([{ status: "pending", result: null }]);
+    await expect(db.select().from(activityLog)).resolves.toHaveLength(0);
+    expect(telemetryMocks.track).not.toHaveBeenCalled();
+
+    const publications: ActivityPublication[] = [];
+    const callbacks: Array<() => void | Promise<void>> = [];
+    await db.transaction(async (tx) => {
+      await svc.addComment(
+        issueId,
+        "Use option A",
+        { userId: "local-board" },
+        undefined,
+        tx,
+        publications,
+        callbacks,
+      );
+    });
+    expect(callbacks).toHaveLength(1);
+    expect(telemetryMocks.track).not.toHaveBeenCalled();
+    for (const callback of callbacks) await callback();
+
+    await expect(db.select().from(issueComments)).resolves.toHaveLength(1);
+    await expect(db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId)))
+      .resolves.toMatchObject([{ status: "expired" }]);
+    await expect(db.select().from(activityLog).where(eq(activityLog.action, "issue.thread_interaction_expired")))
+      .resolves.toHaveLength(1);
+    expect(publications).toHaveLength(1);
+    expect(telemetryMocks.track.mock.calls.filter((call) => call[0] === "interaction.resolved"))
+      .toHaveLength(1);
+  });
 
   it("emits accepted suggested-task telemetry with created and skipped task counts", async () => {
     const { companyId, goalId, issueId } = await seedIssue("Accept suggested tasks telemetry");

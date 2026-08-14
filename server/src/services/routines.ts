@@ -631,6 +631,8 @@ export function routineService(
     heartbeat?: IssueAssignmentWakeupDeps;
     pluginWorkerManager?: PluginWorkerManager;
     runtimeEnv?: Record<string, string | undefined>;
+    afterScheduleClaim?: () => void | Promise<void>;
+    afterScheduledDueSnapshot?: () => void | Promise<void>;
   } = {},
 ) {
   const issueSvc = issueService(db);
@@ -1334,75 +1336,6 @@ export function routineService(
     };
   }
 
-  // Records an automatic firing that was claimed but intentionally not dispatched. The
-  // scheduler advances its tick before calling this helper, so suppressed work is never
-  // replayed after a setting or project state changes.
-  async function recordSuppressedAutomaticRun(input: {
-    routine: typeof routines.$inferSelect;
-    trigger: typeof routineTriggers.$inferSelect;
-    source: "schedule" | "webhook";
-    reason: string;
-    nextRunAt?: Date | null;
-    details?: Record<string, unknown> | null;
-  }) {
-    const triggeredAt = new Date();
-    const run = await db.transaction(async (tx) => {
-      const txDb = tx as unknown as Db;
-      const [createdRun] = await txDb
-        .insert(routineRuns)
-        .values({
-          companyId: input.routine.companyId,
-          routineId: input.routine.id,
-          triggerId: input.trigger.id,
-          source: input.source,
-          status: "skipped",
-          triggeredAt,
-          failureReason: input.reason,
-          completedAt: triggeredAt,
-          linkedIssueId: null,
-          routineRevisionId: input.routine.latestRevisionId,
-          responsibleUserId: input.routine.responsibleUserId ?? null,
-          triggerPayload: input.details ?? null,
-        })
-        .returning();
-      await updateRoutineTouchedState({
-        routineId: input.routine.id,
-        triggerId: input.trigger.id,
-        triggeredAt,
-        status: input.reason === "paused"
-          ? "skipped_paused"
-          : input.reason === "no_external_activity"
-            ? "skipped_no_activity"
-            : "skipped_worktree_execution_cutoff",
-        nextRunAt: input.nextRunAt,
-      }, txDb);
-      return createdRun;
-    });
-
-    try {
-      await logActivity(db, {
-        companyId: input.routine.companyId,
-        actorType: "system",
-        actorId: input.source === "schedule" ? "routine-scheduler" : "routine-webhook",
-        action: "routine.run_skipped",
-        entityType: "routine_run",
-        entityId: run.id,
-        details: {
-          routineId: input.routine.id,
-          triggerId: input.trigger.id,
-          source: input.source,
-          status: "skipped",
-          reason: input.reason,
-          ...(input.details ?? {}),
-        },
-      });
-    } catch (err) {
-      logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to log skipped routine run");
-    }
-
-    return run;
-  }
-
   function routineExecutionFingerprintCondition(dispatchFingerprint?: string | null) {
     if (!dispatchFingerprint) return null;
     // The "default" arm preserves coalescing against pre-migration open issues.
@@ -1621,11 +1554,17 @@ export function routineService(
     projectWorkspaceId?: string | null;
     assigneeAgentId?: string | null;
     idempotencyKey?: string | null;
+    rejectIdempotencyReplay?: boolean;
     executionWorkspaceId?: string | null;
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
     descriptionAppendix?: string | null;
     nextRunAtOverride?: Date | null;
+    expectedTriggerNextRunAt?: Date | null;
+    forcedAutomaticSuppression?: {
+      reason: "no_external_activity";
+      details?: Record<string, unknown> | null;
+    };
     actor?: Actor;
   }) {
     const projectId = input.projectId ?? input.routine.projectId ?? null;
@@ -1686,13 +1625,14 @@ export function routineService(
       title,
       description,
     });
+    const postCommitCallbacks: Array<() => void | Promise<void>> = [];
+    let idempotencyReplayed = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
       const isAutomatic = input.source === "schedule" || input.source === "webhook";
-      // Trigger mutations already serialize routine -> trigger. Keep automatic
-      // dispatches on that same row-lock order, and only MVCC-read the project:
-      // issue creation happens on a separate connection and needs a project FK
-      // key-share lock, so holding a project FOR UPDATE lock here would self-block.
+      // Trigger mutations serialize routine -> trigger -> project. Issue and
+      // wake creation now share this transaction, so a project row lock forms a
+      // real pause barrier without the former cross-connection self-deadlock.
       const lockedRoutine = await txDb
         .select()
         .from(routines)
@@ -1705,27 +1645,37 @@ export function routineService(
       if (!lockedRoutine) throw notFound("Routine not found");
 
       if (input.idempotencyKey) {
-        const triggerScope = input.source === "schedule"
-          ? undefined
-          : input.trigger
-            ? eq(routineRuns.triggerId, input.trigger.id)
-            : isNull(routineRuns.triggerId);
         const existing = await txDb
           .select()
           .from(routineRuns)
           .where(
             and(
               eq(routineRuns.companyId, input.routine.companyId),
-              eq(routineRuns.routineId, input.routine.id),
-              eq(routineRuns.source, input.source),
               eq(routineRuns.idempotencyKey, input.idempotencyKey),
-              triggerScope,
+              input.trigger
+                ? eq(routineRuns.triggerId, input.trigger.id)
+                : and(
+                    eq(routineRuns.routineId, input.routine.id),
+                    eq(routineRuns.source, input.source),
+                    isNull(routineRuns.triggerId),
+                  ),
             ),
           )
           .orderBy(desc(routineRuns.createdAt))
           .limit(1)
           .then((rows) => rows[0] ?? null);
-        if (existing) return existing;
+        if (existing) {
+          if (input.rejectIdempotencyReplay) throw conflict("Webhook replay detected");
+          if (
+            existing.routineId !== input.routine.id ||
+            existing.source !== input.source ||
+            existing.dispatchFingerprint !== dispatchFingerprint
+          ) {
+            throw conflict("Routine idempotency key already has a different dispatch payload");
+          }
+          idempotencyReplayed = true;
+          return existing;
+        }
       }
 
       let automaticSuppressionReason:
@@ -1735,8 +1685,10 @@ export function routineService(
         | "trigger_changed"
         | "paused"
         | "worktree_execution_cutoff"
+        | "no_external_activity"
         | null = null;
       let lockedTrigger: typeof routineTriggers.$inferSelect | null = null;
+      let scheduleSnapshotClaimed = false;
       if (isAutomatic) {
         if (input.trigger) {
           lockedTrigger = await txDb
@@ -1773,8 +1725,8 @@ export function routineService(
           lockedTrigger.secretId !== input.trigger.secretId ||
           (
             input.source === "schedule" &&
-            input.nextRunAtOverride !== undefined &&
-            lockedTrigger.nextRunAt?.getTime() !== input.nextRunAtOverride?.getTime()
+            input.expectedTriggerNextRunAt !== undefined &&
+            lockedTrigger.nextRunAt?.getTime() !== input.expectedTriggerNextRunAt?.getTime()
           )
         )) {
           automaticSuppressionReason = "trigger_changed";
@@ -1788,6 +1740,7 @@ export function routineService(
               eq(projects.id, lockedRoutine.projectId),
               eq(projects.companyId, lockedRoutine.companyId),
             ))
+            .for("update")
             .then((rows) => rows[0] ?? null);
           if (!currentProject) {
             automaticSuppressionReason = "routine_changed";
@@ -1799,6 +1752,26 @@ export function routineService(
         if (!automaticSuppressionReason) {
           const eligibility = await getAutomaticRoutineDispatchEligibility(lockedRoutine);
           if (!eligibility.eligible) automaticSuppressionReason = "worktree_execution_cutoff";
+        }
+        if (!automaticSuppressionReason && input.forcedAutomaticSuppression) {
+          automaticSuppressionReason = input.forcedAutomaticSuppression.reason;
+        }
+
+        const scheduleSnapshotCanBeClaimed =
+          automaticSuppressionReason !== "trigger_not_active" &&
+          automaticSuppressionReason !== "trigger_changed";
+        if (
+          scheduleSnapshotCanBeClaimed &&
+          input.source === "schedule" &&
+          lockedTrigger &&
+          input.nextRunAtOverride !== undefined
+        ) {
+          await txDb
+            .update(routineTriggers)
+            .set({ nextRunAt: input.nextRunAtOverride, updatedAt: new Date() })
+            .where(eq(routineTriggers.id, lockedTrigger.id));
+          scheduleSnapshotClaimed = true;
+          await deps.afterScheduleClaim?.();
         }
       }
 
@@ -1819,7 +1792,9 @@ export function routineService(
             failureReason: automaticSuppressionReason,
             linkedIssueId: null,
             idempotencyKey: input.idempotencyKey ?? null,
-            triggerPayload,
+            triggerPayload: input.forcedAutomaticSuppression?.details
+              ? { ...(triggerPayload ?? {}), ...input.forcedAutomaticSuppression.details }
+              : triggerPayload,
             dispatchFingerprint,
             routineRevisionId: lockedRoutine.latestRevisionId,
             responsibleUserId: lockedRoutine.responsibleUserId ?? null,
@@ -1831,7 +1806,9 @@ export function routineService(
           triggerId: lockedTrigger?.id ?? null,
           triggeredAt,
           status: `skipped_${automaticSuppressionReason}`,
-          nextRunAt: input.nextRunAtOverride,
+          nextRunAt: input.source === "schedule" && !scheduleSnapshotClaimed
+            ? undefined
+            : input.nextRunAtOverride,
         }, txDb);
         return suppressedRun;
       }
@@ -1937,7 +1914,7 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
-          });
+          }, txDb);
         } catch (error) {
           const isOpenExecutionConflict =
             !!error &&
@@ -1981,7 +1958,8 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
+        // Issue, run, and durable wake intent commit together. Starting the
+        // queued heartbeat is deliberately deferred until after commit.
         await queueIssueAssignmentWakeup({
           heartbeat,
           issue: createdIssue,
@@ -1990,6 +1968,11 @@ export function routineService(
           contextSource: "routine.dispatch",
           requestedByActorType: input.source === "schedule" ? "system" : undefined,
           rethrowOnError: true,
+          executor: txDb,
+          companyId: input.routine.companyId,
+          responsibleUserId,
+          idempotencyKey: `routine-dispatch:${createdRun.id}`,
+          postCommitCallbacks,
         });
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
@@ -2025,7 +2008,18 @@ export function routineService(
       }
     });
 
-    if (input.source === "schedule" || input.source === "webhook") {
+    for (const callback of postCommitCallbacks) {
+      try {
+        await callback();
+      } catch (err) {
+        // The queued run is durable and resumeQueuedRuns can replay delivery.
+        // A post-commit starter failure must not make callers retry a mutation
+        // that already committed.
+        logger.warn({ err, routineId: input.routine.id, runId: run.id }, "failed to start durable routine wakeup");
+      }
+    }
+
+    if (!idempotencyReplayed && (input.source === "schedule" || input.source === "webhook")) {
       const actorId = input.source === "schedule" ? "routine-scheduler" : "routine-webhook";
       const suppressed = run.status === "skipped" && run.failureReason != null;
       try {
@@ -2050,7 +2044,7 @@ export function routineService(
     }
 
     const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
+    if (telemetryClient && !idempotencyReplayed) {
       trackRoutineRun(telemetryClient, {
         source: run.source,
         status: run.status,
@@ -2926,6 +2920,7 @@ export function routineService(
       if (!routine) throw notFound("Routine not found");
       if (!trigger.enabled || routine.status !== "active") throw conflict("Routine trigger is not active");
 
+      let hmacReplayKey: string | null = null;
       if (trigger.signingMode === "none") {
         // No authentication — the publicId in the URL acts as a shared secret.
       } else if (trigger.signingMode === "github_hmac") {
@@ -2982,16 +2977,10 @@ export function routineService(
           normalizedSignature.length === expectedHmac.length &&
           crypto.timingSafeEqual(Buffer.from(normalizedSignature), Buffer.from(expectedHmac));
         if (!valid) throw unauthorized();
-      }
-
-      const eligibility = await getAutomaticRoutineDispatchEligibility(routine);
-      if (!eligibility.eligible) {
-        return recordSuppressedAutomaticRun({
-          routine,
-          trigger,
-          source: "webhook",
-          reason: "worktree_execution_cutoff",
-        });
+        hmacReplayKey = `webhook-hmac:${crypto
+          .createHash("sha256")
+          .update(`${trigger.id}:${providedTimestamp}:${expectedHmac}`)
+          .digest("hex")}`;
       }
 
       return dispatchRoutineRun({
@@ -3002,7 +2991,8 @@ export function routineService(
         variables: isPlainRecord(input.payload) && isPlainRecord(input.payload.variables)
           ? input.payload.variables
           : null,
-        idempotencyKey: input.idempotencyKey,
+        idempotencyKey: hmacReplayKey ?? input.idempotencyKey,
+        rejectIdempotencyReplay: hmacReplayKey !== null,
       });
     },
 
@@ -3106,6 +3096,7 @@ export function routineService(
           ),
         )
         .orderBy(asc(routineTriggers.nextRunAt), asc(routineTriggers.createdAt));
+      await deps.afterScheduledDueSnapshot?.();
 
       let triggered = 0;
       for (const row of due) {
@@ -3136,49 +3127,25 @@ export function routineService(
           }
         }
 
-        const claimed = await db
-          .update(routineTriggers)
-          .set({
-            nextRunAt: claimedNextRunAt,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(routineTriggers.id, row.trigger.id),
-              eq(routineTriggers.enabled, true),
-              eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
-            ),
-          )
-          .returning({ id: routineTriggers.id })
-          .then((rows) => rows[0] ?? null);
-        if (!claimed) continue;
-
-        if (projectPaused || worktreeSuppressed) {
-          await recordSuppressedAutomaticRun({
-            routine: row.routine,
-            trigger: row.trigger,
-            source: "schedule",
-            reason: worktreeSuppressed ? "worktree_execution_cutoff" : "paused",
-            nextRunAt: claimedNextRunAt,
-          });
-          continue;
-        }
-
         const activityGate = row.routine.activityGatePolicy === "require_external_activity"
           ? await evaluateActivityGate(row.routine, now)
           : null;
         if (activityGate && !activityGate.fire) {
-          await recordSuppressedAutomaticRun({
+          await dispatchRoutineRun({
             routine: row.routine,
             trigger: row.trigger,
             source: "schedule",
-            reason: "no_external_activity",
-            nextRunAt: claimedNextRunAt,
-            details: {
-              activityGate: {
-                verdict: "quiet",
-                windowStart: activityGate.windowStart?.toISOString() ?? null,
-                matchedActivityId: null,
+            idempotencyKey: `schedule:${row.trigger.id}:${row.trigger.nextRunAt.toISOString()}:0`,
+            expectedTriggerNextRunAt: row.trigger.nextRunAt,
+            nextRunAtOverride: claimedNextRunAt,
+            forcedAutomaticSuppression: {
+              reason: "no_external_activity",
+              details: {
+                activityGate: {
+                  verdict: "quiet",
+                  windowStart: activityGate.windowStart?.toISOString() ?? null,
+                  matchedActivityId: null,
+                },
               },
             },
           });
@@ -3191,9 +3158,11 @@ export function routineService(
             trigger: row.trigger,
             source: "schedule",
             idempotencyKey: `schedule:${row.trigger.id}:${row.trigger.nextRunAt.toISOString()}:${i}`,
+            expectedTriggerNextRunAt: i === 0 ? row.trigger.nextRunAt : claimedNextRunAt,
             nextRunAtOverride: claimedNextRunAt,
           });
-          if (!(run.status === "skipped" && run.failureReason != null)) triggered += 1;
+          if (run.status === "skipped" && run.failureReason != null) break;
+          triggered += 1;
         }
       }
 

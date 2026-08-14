@@ -6258,6 +6258,7 @@ export function issueRoutes(
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitCallbacks: Array<() => void | Promise<void>> = [];
     const result = await db.transaction(async (tx) => {
       let issue = existing;
       if (outcome === "blocked") {
@@ -6290,6 +6291,7 @@ export function issueRoutes(
           },
           tx,
           postCommitActivityPublications,
+          postCommitCallbacks,
         );
         if (!updatedIssue) throw notFound("Issue not found");
         issue = updatedIssue;
@@ -6311,6 +6313,13 @@ export function issueRoutes(
       return { issue, recoveryAction };
     });
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    for (const callback of postCommitCallbacks) {
+      try {
+        await callback();
+      } catch {
+        // The recovery mutation is committed; telemetry is best-effort.
+      }
+    }
 
     await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
@@ -9001,6 +9010,7 @@ export function issueRoutes(
       value: Awaited<ReturnType<typeof svc.addStopRelayCommentIfNeeded>>;
     } = { value: null };
     const postCommitActivityPublications: ActivityPublication[] = [];
+    const postCommitCallbacks: Array<() => void | Promise<void>> = [];
     const issueUpdateData = {
       ...updateFields,
       actorAgentId: actor.agentId ?? null,
@@ -9010,12 +9020,16 @@ export function issueRoutes(
       actor.actorType === "user" && existing.status !== "done" && updateFields.status === "done";
     const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
       if (tx) {
-        return shouldCollectCompletionPublication
-          ? svc.update(id, issueUpdateData, tx, postCommitActivityPublications)
-          : svc.update(id, issueUpdateData, tx);
+        return svc.update(
+          id,
+          issueUpdateData,
+          tx,
+          postCommitActivityPublications,
+          postCommitCallbacks,
+        );
       }
       return shouldCollectCompletionPublication
-        ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
+        ? svc.update(id, issueUpdateData, db, postCommitActivityPublications, postCommitCallbacks)
         : svc.update(id, issueUpdateData);
     };
     const persistBoundReviewActivity = async (
@@ -9126,6 +9140,13 @@ export function issueRoutes(
       return;
     }
     for (const publication of postCommitActivityPublications) publishActivity(publication);
+    for (const callback of postCommitCallbacks) {
+      try {
+        await callback();
+      } catch {
+        // The issue mutation is committed; telemetry is best-effort.
+      }
+    }
 
     if (enteringBlocked) {
       const blockedIssue = issue;
@@ -11327,6 +11348,7 @@ export function issueRoutes(
       };
       let txResult: { comment: Awaited<ReturnType<typeof svc.addComment>>; issue: NonNullable<Awaited<ReturnType<typeof svc.update>>> };
       const postCommitActivityPublications: ActivityPublication[] = [];
+      const postCommitCallbacks: Array<() => void | Promise<void>> = [];
       try {
         txResult = await db.transaction(async (tx) => {
           const insertedComment = await svc.addComment(
@@ -11340,10 +11362,16 @@ export function issueRoutes(
             },
             { ...commentOptions, authorizationReason: commentAuthorizationReason },
             tx,
+            postCommitActivityPublications,
+            postCommitCallbacks,
           );
-          const updated = actor.actorType === "user" && currentIssue.status !== "done"
-            ? await svc.update(id, updatePatch, tx, postCommitActivityPublications)
-            : await svc.update(id, updatePatch, tx);
+          const updated = await svc.update(
+            id,
+            updatePatch,
+            tx,
+            postCommitActivityPublications,
+            postCommitCallbacks,
+          );
           // Throw (not return null) so drizzle rolls back the inserted comment when the issue
           // has been concurrently deleted between the initial fetch and the in-transaction update.
           if (!updated) throw new AutoApprovalIssueMissingError();
@@ -11373,6 +11401,14 @@ export function issueRoutes(
         throw err;
       }
       for (const publication of postCommitActivityPublications) publishActivity(publication);
+      for (const callback of postCommitCallbacks) {
+        try {
+          await callback();
+        } catch {
+          // The comment/status transaction is committed; post-commit telemetry
+          // is best-effort and cannot change the HTTP mutation result.
+        }
+      }
       comment = txResult.comment;
       currentIssue = txResult.issue;
       // Mirror the normal status-change audit trail: every other in_review -> done path
