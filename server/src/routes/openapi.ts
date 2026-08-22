@@ -1050,7 +1050,7 @@ function applyDocumentFixups(document: any): any {
       scheme: "bearer",
       bearerFormat: "Paperclip Run JWT",
       description:
-        "Paperclip-issued agent JWT bound to an active heartbeat run. Ordinary agent API keys are not accepted.",
+        "Paperclip-issued agent JWT with a signed heartbeat run_id claim. Ordinary agent API keys are not accepted.",
     },
   };
   document.security = AUTHENTICATED_SECURITY;
@@ -1084,7 +1084,7 @@ function applyDocumentFixups(document: any): any {
         operation["x-paperclip-authorization"] = {
           actor: "board_or_run_scoped_agent",
           agentCredential: "run_scoped_jwt",
-          heartbeatRunRequired: true,
+          signedRunIdRequired: true,
         };
       }
 

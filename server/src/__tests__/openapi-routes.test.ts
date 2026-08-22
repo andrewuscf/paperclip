@@ -280,10 +280,12 @@ describe("openapi routes", () => {
     const boardResumeHandoff = spec.paths[
       "/api/issues/{id}/tree-holds/{holdId}/board-resume-handoff"
     ].post;
-    expect(spec.components.securitySchemes.RunScopedAgentJwtAuth).toMatchObject({
+    expect(spec.components.securitySchemes.RunScopedAgentJwtAuth).toEqual({
       type: "http",
       scheme: "bearer",
       bearerFormat: "Paperclip Run JWT",
+      description:
+        "Paperclip-issued agent JWT with a signed heartbeat run_id claim. Ordinary agent API keys are not accepted.",
     });
     expect(boardResumeHandoff.security).toEqual([
       { BoardSessionAuth: [] },
@@ -294,7 +296,7 @@ describe("openapi routes", () => {
     expect(boardResumeHandoff["x-paperclip-authorization"]).toEqual({
       actor: "board_or_run_scoped_agent",
       agentCredential: "run_scoped_jwt",
-      heartbeatRunRequired: true,
+      signedRunIdRequired: true,
     });
     expect(boardResumeHandoff.requestBody.content["application/json"].schema).toMatchObject({
       type: "object",
