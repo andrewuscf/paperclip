@@ -280,8 +280,22 @@ describe("openapi routes", () => {
     const boardResumeHandoff = spec.paths[
       "/api/issues/{id}/tree-holds/{holdId}/board-resume-handoff"
     ].post;
-    expect(boardResumeHandoff.security).toContainEqual({ AgentBearerAuth: [] });
-    expect(boardResumeHandoff["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(spec.components.securitySchemes.RunScopedAgentJwtAuth).toMatchObject({
+      type: "http",
+      scheme: "bearer",
+      bearerFormat: "Paperclip Run JWT",
+    });
+    expect(boardResumeHandoff.security).toEqual([
+      { BoardSessionAuth: [] },
+      { BoardApiKeyAuth: [] },
+      { RunScopedAgentJwtAuth: [] },
+    ]);
+    expect(boardResumeHandoff.security).not.toContainEqual({ AgentBearerAuth: [] });
+    expect(boardResumeHandoff["x-paperclip-authorization"]).toEqual({
+      actor: "board_or_run_scoped_agent",
+      agentCredential: "run_scoped_jwt",
+      heartbeatRunRequired: true,
+    });
     expect(boardResumeHandoff.requestBody.content["application/json"].schema).toMatchObject({
       type: "object",
       required: expect.arrayContaining(["boardResumeCommentId", "boardResumeCommentSha256"]),

@@ -54,6 +54,122 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     await tempDb?.cleanup();
   });
 
+  async function seedBoardResumeRace() {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const agentId = randomUUID();
+    const firstRunId = randomUUID();
+    const secondRunId = randomUUID();
+    const firstCommentId = randomUUID();
+    const secondCommentId = randomUUID();
+    const firstBody = "Resuming: release this exact stale hold from the first directive.";
+    const secondBody = "Resuming: release this exact stale hold from the competing directive.";
+    const firstBodySha256 = createHash("sha256").update(firstBody, "utf8").digest("hex");
+    const secondBodySha256 = createHash("sha256").update(secondBody, "utf8").digest("hex");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: rootIssueId,
+      companyId,
+      title: "Root",
+      status: "in_progress",
+      priority: "medium",
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: firstRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "running",
+        contextSnapshot: { issueId: rootIssueId },
+      },
+      {
+        id: secondRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "running",
+        contextSnapshot: { issueId: rootIssueId },
+      },
+    ]);
+    await db.insert(issueComments).values([
+      {
+        id: firstCommentId,
+        companyId,
+        issueId: rootIssueId,
+        authorUserId: "board-user",
+        body: firstBody,
+        createdAt: new Date(Date.now() + 60_000),
+      },
+      {
+        id: secondCommentId,
+        companyId,
+        issueId: rootIssueId,
+        authorUserId: "board-user",
+        body: secondBody,
+        createdAt: new Date(Date.now() + 61_000),
+      },
+    ]);
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "user",
+        actorId: "board-user",
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: rootIssueId,
+        details: { commentId: firstCommentId },
+      },
+      {
+        companyId,
+        actorType: "user",
+        actorId: "board-user",
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: rootIssueId,
+        details: { commentId: secondCommentId },
+      },
+    ]);
+
+    const svc = issueTreeControlService(db);
+    const created = await svc.createHold(companyId, rootIssueId, {
+      mode: "pause",
+      reason: "stale subtree hold",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    return {
+      companyId,
+      rootIssueId,
+      agentId,
+      firstRunId,
+      secondRunId,
+      firstCommentId,
+      secondCommentId,
+      firstBodySha256,
+      secondBodySha256,
+      holdId: created.hold.id,
+      svc,
+    };
+  }
+
   it("previews a subtree without changing issue statuses", async () => {
     const companyId = randomUUID();
     const otherCompanyId = randomUUID();
@@ -358,6 +474,107 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
         holdId: created.hold.id,
         boardResumeCommentId: commentId,
         boardResumeCommentSha256: bodySha256,
+      },
+    });
+  });
+
+  it("collapses concurrent identical board-resume handoffs to one provenance-preserving release", async () => {
+    const fixture = await seedBoardResumeRace();
+    const sharedBinding = {
+      boardResumeCommentId: fixture.firstCommentId,
+      boardResumeCommentSha256: fixture.firstBodySha256,
+    };
+
+    const [first, second] = await Promise.all([
+      fixture.svc.releaseHoldFromBoardResume(fixture.companyId, fixture.rootIssueId, fixture.holdId, {
+        ...sharedBinding,
+        actor: {
+          actorType: "agent",
+          actorId: fixture.agentId,
+          agentId: fixture.agentId,
+          runId: fixture.firstRunId,
+        },
+      }),
+      fixture.svc.releaseHoldFromBoardResume(fixture.companyId, fixture.rootIssueId, fixture.holdId, {
+        ...sharedBinding,
+        actor: {
+          actorType: "agent",
+          actorId: fixture.agentId,
+          agentId: fixture.agentId,
+          runId: fixture.secondRunId,
+        },
+      }),
+    ]);
+
+    expect([first.replayed, second.replayed].sort()).toEqual([false, true]);
+    const winner = first.replayed ? second : first;
+    const replay = first.replayed ? first : second;
+    expect(replay.hold).toEqual(winner.hold);
+    expect(winner.hold.releasedByRunId).toMatch(/^[0-9a-f-]{36}$/);
+
+    const stored = await fixture.svc.getHold(fixture.companyId, fixture.holdId);
+    expect(stored).toMatchObject({
+      releasedByRunId: winner.hold.releasedByRunId,
+      releaseMetadata: {
+        handoffKind: "board_resume_comment",
+        handoffVersion: 1,
+        rootIssueId: fixture.rootIssueId,
+        holdId: fixture.holdId,
+        ...sharedBinding,
+      },
+    });
+  });
+
+  it("lets only one conflicting board-resume handoff win without overwriting provenance", async () => {
+    const fixture = await seedBoardResumeRace();
+    const attempts = [
+      {
+        boardResumeCommentId: fixture.firstCommentId,
+        boardResumeCommentSha256: fixture.firstBodySha256,
+        runId: fixture.firstRunId,
+      },
+      {
+        boardResumeCommentId: fixture.secondCommentId,
+        boardResumeCommentSha256: fixture.secondBodySha256,
+        runId: fixture.secondRunId,
+      },
+    ];
+
+    const results = await Promise.allSettled(attempts.map((attempt) =>
+      fixture.svc.releaseHoldFromBoardResume(fixture.companyId, fixture.rootIssueId, fixture.holdId, {
+        boardResumeCommentId: attempt.boardResumeCommentId,
+        boardResumeCommentSha256: attempt.boardResumeCommentSha256,
+        actor: {
+          actorType: "agent",
+          actorId: fixture.agentId,
+          agentId: fixture.agentId,
+          runId: attempt.runId,
+        },
+      }),
+    ));
+
+    const fulfilled = results.flatMap((result, index) =>
+      result.status === "fulfilled" ? [{ index, value: result.value }] : [],
+    );
+    const rejected = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    expect(fulfilled).toHaveLength(1);
+    expect(fulfilled[0]?.value.replayed).toBe(false);
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({ status: 409 });
+
+    const winner = attempts[fulfilled[0]!.index]!;
+    const stored = await fixture.svc.getHold(fixture.companyId, fixture.holdId);
+    expect(stored).toMatchObject({
+      releasedByRunId: winner.runId,
+      releaseMetadata: {
+        handoffKind: "board_resume_comment",
+        handoffVersion: 1,
+        rootIssueId: fixture.rootIssueId,
+        holdId: fixture.holdId,
+        boardResumeCommentId: winner.boardResumeCommentId,
+        boardResumeCommentSha256: winner.boardResumeCommentSha256,
       },
     });
   });

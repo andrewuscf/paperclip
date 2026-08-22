@@ -721,6 +721,7 @@ type OpenApiAuthLevel =
 const BOARD_SESSION_AUTH_SCHEME = "BoardSessionAuth";
 const BOARD_API_KEY_AUTH_SCHEME = "BoardApiKeyAuth";
 const AGENT_BEARER_AUTH_SCHEME = "AgentBearerAuth";
+const RUN_SCOPED_AGENT_JWT_AUTH_SCHEME = "RunScopedAgentJwtAuth";
 
 function securityRequirement(name: string): Record<string, string[]> {
   return { [name]: [] };
@@ -735,6 +736,10 @@ const AUTHENTICATED_SECURITY: Array<Record<string, string[]>> = [
   ...BOARD_SECURITY,
   securityRequirement(AGENT_BEARER_AUTH_SCHEME),
 ];
+
+const BOARD_OR_RUN_SCOPED_AGENT_OPERATIONS = new Set([
+  "POST /api/issues/{id}/tree-holds/{holdId}/board-resume-handoff",
+]);
 
 const PUBLIC_OPERATIONS = new Set([
   "GET /api/health",
@@ -1040,11 +1045,19 @@ function applyDocumentFixups(document: any): any {
       description:
         "Agent API key or Paperclip-issued local agent JWT presented in the Authorization bearer header.",
     },
+    [RUN_SCOPED_AGENT_JWT_AUTH_SCHEME]: {
+      type: "http",
+      scheme: "bearer",
+      bearerFormat: "Paperclip Run JWT",
+      description:
+        "Paperclip-issued agent JWT bound to an active heartbeat run. Ordinary agent API keys are not accepted.",
+    },
   };
   document.security = AUTHENTICATED_SECURITY;
 
   for (const [path, pathItem] of Object.entries(document.paths ?? {})) {
     for (const [method, operation] of Object.entries(pathItem as Record<string, any>)) {
+      const key = operationKey(method, path);
       const authLevel = resolveOperationAuthLevel(method, path);
       if (authLevel === "public") {
         operation.security = [];
@@ -1063,7 +1076,18 @@ function applyDocumentFixups(document: any): any {
               ? { actor: "board_or_agent" }
               : { actor: "public" };
 
-      const key = operationKey(method, path);
+      if (BOARD_OR_RUN_SCOPED_AGENT_OPERATIONS.has(key)) {
+        operation.security = [
+          ...BOARD_SECURITY,
+          securityRequirement(RUN_SCOPED_AGENT_JWT_AUTH_SCHEME),
+        ];
+        operation["x-paperclip-authorization"] = {
+          actor: "board_or_run_scoped_agent",
+          agentCredential: "run_scoped_jwt",
+          heartbeatRunRequired: true,
+        };
+      }
+
       if (authLevel !== "public") {
         const responses = (operation.responses ??= {}) as Record<string, unknown>;
         if (!responses["403"]) {

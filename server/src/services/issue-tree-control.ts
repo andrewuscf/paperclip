@@ -1187,8 +1187,19 @@ export function issueTreeControlService(db: Db) {
         releaseMetadata: input.metadata ?? null,
         updatedAt: new Date(),
       })
-      .where(and(eq(issueTreeHolds.id, holdId), eq(issueTreeHolds.companyId, companyId)))
+      .where(
+        and(
+          eq(issueTreeHolds.id, holdId),
+          eq(issueTreeHolds.companyId, companyId),
+          eq(issueTreeHolds.rootIssueId, rootIssueId),
+          eq(issueTreeHolds.status, "active"),
+        ),
+      )
       .returning();
+
+    if (!updated) {
+      throw conflict("Issue tree hold is already released");
+    }
 
     const members = await db
       .select()
