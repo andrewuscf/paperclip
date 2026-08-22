@@ -386,6 +386,7 @@ function zodToOpenApiSchema(schema: z.ZodTypeAny): JsonSchema {
     }
     const jsonSchema: JsonSchema = { type: "object", properties };
     if (required.length > 0) jsonSchema.required = required;
+    if (unwrapped._def.unknownKeys === "strict") jsonSchema.additionalProperties = false;
     return jsonSchema;
   }
 

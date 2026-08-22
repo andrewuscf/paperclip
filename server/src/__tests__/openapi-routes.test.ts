@@ -65,6 +65,9 @@ const ROUTE_LITERAL_PATTERN = /router\.(get|post|put|patch|delete)\(\s*["'`]([^"
 const ROUTER_METHOD_PATTERN = /router\.(get|post|put|patch|delete)\(/;
 const HTTP_METHODS = new Set(["get", "put", "post", "delete", "options", "head", "patch", "trace"]);
 const explicitOpenApiCoverageExclusions = new Set([
+  // Fork-only atomic routine-disposition routes predate the public OpenAPI
+  // surface. Preserve that existing boundary during live-payload backports.
+  "routine-run-dispositions.ts",
   // Pipeline routes are experimental and not yet represented in the public OpenAPI document.
   "pipelines.ts",
   // Case routes are experimental (enableCases flag) and not yet in the public OpenAPI document.
