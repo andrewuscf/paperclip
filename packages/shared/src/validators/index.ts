@@ -512,9 +512,11 @@ export {
   issueTreeControlModeSchema,
   issueTreeHoldReleasePolicySchema,
   previewIssueTreeControlSchema,
+  releaseIssueTreeHoldFromBoardResumeSchema,
   releaseIssueTreeHoldSchema,
   type CreateIssueTreeHold,
   type PreviewIssueTreeControl,
+  type ReleaseIssueTreeHoldFromBoardResume,
   type ReleaseIssueTreeHold,
 } from "./issue-tree-control.js";
 

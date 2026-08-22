@@ -5,11 +5,13 @@ import {
   createIssueTreeHoldSchema,
   isUuidLike,
   previewIssueTreeControlSchema,
+  releaseIssueTreeHoldFromBoardResumeSchema,
   releaseIssueTreeHoldSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { heartbeatService, issueService, issueTreeControlService, logActivity } from "../services/index.js";
-import { assertBoard, getAccessibleResource, getActorInfo } from "./authz.js";
+import { forbidden } from "../errors.js";
+import { assertBoard, assertBoardOrAgent, getAccessibleResource, getActorInfo } from "./authz.js";
 
 const TREE_RUN_CANCELLATION_RESPONSE_WAIT_MS = 1_000;
 
@@ -388,6 +390,57 @@ export function issueTreeControlRoutes(db: Db) {
       });
 
       res.json(hold);
+    },
+  );
+
+  router.post(
+    "/issues/:id/tree-holds/:holdId/board-resume-handoff",
+    validate(releaseIssueTreeHoldFromBoardResumeSchema),
+    async (req, res) => {
+      assertBoardOrAgent(req);
+      if (req.actor.type === "agent" && (!req.actor.runId || req.actor.source !== "agent_jwt")) {
+        throw forbidden("Run-scoped agent access required for board-resume handoff");
+      }
+
+      const root = await getAccessibleResource(req, res, resolveRootIssue(req), "Root issue not found");
+      if (!root) return;
+      const holdId = req.params.holdId as string;
+      if (!isUuidLike(holdId)) {
+        res.status(400).json({ error: "Invalid hold ID" });
+        return;
+      }
+
+      const actor = getActorInfo(req);
+      const result = await treeControlSvc.releaseHoldFromBoardResume(root.companyId, root.id, holdId, {
+        ...req.body,
+        actor: {
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+          runId: actor.runId,
+        },
+      });
+      await logActivity(db, {
+        companyId: root.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.tree_hold_board_resume_handoff_applied",
+        entityType: "issue",
+        entityId: root.id,
+        details: {
+          holdId: result.hold.id,
+          mode: result.hold.mode,
+          boardResumeCommentId: req.body.boardResumeCommentId,
+          boardResumeCommentSha256: req.body.boardResumeCommentSha256,
+          replayed: result.replayed,
+        },
+      });
+
+      res.json(result);
     },
   );
 

@@ -1,9 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   agents,
   agentWakeupRequests,
+  activityLog,
   companies,
   createDb,
   heartbeatRuns,
@@ -38,6 +39,7 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(activityLog);
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
     await db.delete(issueComments);
@@ -262,6 +264,281 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     expect(released.status).toBe("released");
     expect(released.releaseReason).toBe("operator resumed");
     expect(released.members).toHaveLength(1);
+  });
+
+  it("releases one exact pause hold from an audited board resume and replays idempotently", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const commentId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const body = "Resuming: the board already moved this issue back to todo.";
+    const bodySha256 = createHash("sha256").update(body, "utf8").digest("hex");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CTO",
+      role: "cto",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "running",
+      contextSnapshot: { issueId: rootIssueId },
+    });
+    await db.insert(issues).values({
+      id: rootIssueId,
+      companyId,
+      title: "Root",
+      status: "in_progress",
+      priority: "medium",
+    });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: rootIssueId,
+      authorUserId: "board-user",
+      body,
+      createdAt: new Date(Date.now() + 60_000),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: rootIssueId,
+      details: { commentId },
+    });
+
+    const svc = issueTreeControlService(db);
+    const created = await svc.createHold(companyId, rootIssueId, {
+      mode: "pause",
+      reason: "stale subtree hold",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+    const input = {
+      boardResumeCommentId: commentId,
+      boardResumeCommentSha256: bodySha256,
+      actor: { actorType: "agent" as const, actorId: agentId, agentId, runId },
+    };
+
+    const first = await svc.releaseHoldFromBoardResume(companyId, rootIssueId, created.hold.id, input);
+    const second = await svc.releaseHoldFromBoardResume(companyId, rootIssueId, created.hold.id, input);
+
+    expect(first.replayed).toBe(false);
+    expect(second.replayed).toBe(true);
+    expect(second.hold.releasedAt).toEqual(first.hold.releasedAt);
+    expect(first.hold).toMatchObject({
+      id: created.hold.id,
+      rootIssueId,
+      mode: "pause",
+      status: "released",
+      releasedByActorType: "agent",
+      releasedByAgentId: agentId,
+      releasedByRunId: runId,
+      releaseMetadata: {
+        handoffKind: "board_resume_comment",
+        handoffVersion: 1,
+        rootIssueId,
+        holdId: created.hold.id,
+        boardResumeCommentId: commentId,
+        boardResumeCommentSha256: bodySha256,
+      },
+    });
+  });
+
+  it("rejects a changed board-resume digest without releasing the hold", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const commentId = randomUUID();
+    const body = "Resuming: release this exact stale hold.";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: rootIssueId, companyId, title: "Root", status: "todo", priority: "medium" });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: rootIssueId,
+      authorUserId: "board-user",
+      body,
+      createdAt: new Date(Date.now() + 60_000),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: rootIssueId,
+      details: { commentId },
+    });
+
+    const svc = issueTreeControlService(db);
+    const created = await svc.createHold(companyId, rootIssueId, {
+      mode: "pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    await expect(svc.releaseHoldFromBoardResume(companyId, rootIssueId, created.hold.id, {
+      boardResumeCommentId: commentId,
+      boardResumeCommentSha256: "0".repeat(64),
+      actor: { actorType: "agent", actorId: randomUUID(), agentId: randomUUID(), runId: randomUUID() },
+    })).rejects.toMatchObject({ status: 422 });
+
+    expect(await svc.getHold(companyId, created.hold.id)).toMatchObject({ status: "active" });
+  });
+
+  it("rejects a board-looking resume comment without a matching user audit event", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const commentId = randomUUID();
+    const body = "Resuming: this row was not recorded by a board actor.";
+    const bodySha256 = createHash("sha256").update(body, "utf8").digest("hex");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: rootIssueId, companyId, title: "Root", status: "todo", priority: "medium" });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: rootIssueId,
+      authorUserId: "board-user",
+      body,
+      createdAt: new Date(Date.now() + 60_000),
+    });
+
+    const svc = issueTreeControlService(db);
+    const created = await svc.createHold(companyId, rootIssueId, {
+      mode: "pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    await expect(svc.releaseHoldFromBoardResume(companyId, rootIssueId, created.hold.id, {
+      boardResumeCommentId: commentId,
+      boardResumeCommentSha256: bodySha256,
+      actor: { actorType: "system", actorId: "test-system" },
+    })).rejects.toMatchObject({ status: 422 });
+
+    expect(await svc.getHold(companyId, created.hold.id)).toMatchObject({ status: "active" });
+  });
+
+  it("rejects an audited board comment that does not carry an explicit resume directive", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const commentId = randomUUID();
+    const body = "Keep this subtree paused until a later decision.";
+    const bodySha256 = createHash("sha256").update(body, "utf8").digest("hex");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: rootIssueId, companyId, title: "Root", status: "todo", priority: "medium" });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: rootIssueId,
+      authorUserId: "board-user",
+      body,
+      createdAt: new Date(Date.now() + 60_000),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: rootIssueId,
+      details: { commentId },
+    });
+
+    const svc = issueTreeControlService(db);
+    const created = await svc.createHold(companyId, rootIssueId, {
+      mode: "pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    await expect(svc.releaseHoldFromBoardResume(companyId, rootIssueId, created.hold.id, {
+      boardResumeCommentId: commentId,
+      boardResumeCommentSha256: bodySha256,
+      actor: { actorType: "agent", actorId: randomUUID(), agentId: randomUUID(), runId: randomUUID() },
+    })).rejects.toMatchObject({ status: 422 });
+
+    expect(await svc.getHold(companyId, created.hold.id)).toMatchObject({ status: "active" });
+  });
+
+  it("rejects a board resume recorded before the exact hold was created", async () => {
+    const companyId = randomUUID();
+    const rootIssueId = randomUUID();
+    const commentId = randomUUID();
+    const body = "Resuming: this directive predates the new hold.";
+    const bodySha256 = createHash("sha256").update(body, "utf8").digest("hex");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({ id: rootIssueId, companyId, title: "Root", status: "todo", priority: "medium" });
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId: rootIssueId,
+      authorUserId: "board-user",
+      body,
+      createdAt: new Date("2020-01-01T00:00:00.000Z"),
+    });
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "user",
+      actorId: "board-user",
+      action: "issue.comment_added",
+      entityType: "issue",
+      entityId: rootIssueId,
+      details: { commentId },
+      createdAt: new Date("2020-01-01T00:00:00.001Z"),
+    });
+
+    const svc = issueTreeControlService(db);
+    const created = await svc.createHold(companyId, rootIssueId, {
+      mode: "pause",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    await expect(svc.releaseHoldFromBoardResume(companyId, rootIssueId, created.hold.id, {
+      boardResumeCommentId: commentId,
+      boardResumeCommentSha256: bodySha256,
+      actor: { actorType: "system", actorId: "test-system" },
+    })).rejects.toMatchObject({ status: 422 });
+
+    expect(await svc.getHold(companyId, created.hold.id)).toMatchObject({ status: "active" });
   });
 
   it("cancels non-terminal issue statuses and restores from the cancel snapshot", async () => {

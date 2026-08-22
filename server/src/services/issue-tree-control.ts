@@ -1,6 +1,8 @@
+import { createHash } from "node:crypto";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agentWakeupRequests,
   heartbeatRuns,
   issueComments,
@@ -73,6 +75,8 @@ const TERMINAL_ISSUE_STATUSES = new Set<IssueStatus>(["done", "cancelled"]);
 const ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const DEFAULT_RELEASE_POLICY: IssueTreeHoldReleasePolicy = { strategy: "manual" };
 const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
+const BOARD_RESUME_HANDOFF_KIND = "board_resume_comment";
+const BOARD_RESUME_HANDOFF_VERSION = 1;
 export const ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_commented",
   "issue_reopened_via_comment",
@@ -232,6 +236,33 @@ function normalizeReleasePolicy(
 
 function coerceIssueStatus(status: string): IssueStatus {
   return ISSUE_STATUSES.includes(status as IssueStatus) ? (status as IssueStatus) : "backlog";
+}
+
+function sha256Utf8(value: string) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isExplicitBoardResumeDirective(body: string) {
+  return /^\s*resum(?:e|ing)\s*:/i.test(body);
+}
+
+function isMatchingBoardResumeHandoff(
+  hold: IssueTreeHold,
+  input: {
+    rootIssueId: string;
+    holdId: string;
+    boardResumeCommentId: string;
+    boardResumeCommentSha256: string;
+  },
+) {
+  const metadata = hold.releaseMetadata;
+  return hold.status === "released"
+    && metadata?.handoffKind === BOARD_RESUME_HANDOFF_KIND
+    && metadata.handoffVersion === BOARD_RESUME_HANDOFF_VERSION
+    && metadata.rootIssueId === input.rootIssueId
+    && metadata.holdId === input.holdId
+    && metadata.boardResumeCommentId === input.boardResumeCommentId
+    && metadata.boardResumeCommentSha256 === input.boardResumeCommentSha256;
 }
 
 function isTerminalIssue(status: string): status is IssueStatus {
@@ -1168,6 +1199,114 @@ export function issueTreeControlService(db: Db) {
     return toHold(updated, members);
   }
 
+  async function releaseHoldFromBoardResume(
+    companyId: string,
+    rootIssueId: string,
+    holdId: string,
+    input: {
+      boardResumeCommentId: string;
+      boardResumeCommentSha256: string;
+      actor: ActorInput;
+    },
+  ): Promise<{ hold: IssueTreeHold; replayed: boolean }> {
+    const comment = await db
+      .select({
+        id: issueComments.id,
+        body: issueComments.body,
+        authorAgentId: issueComments.authorAgentId,
+        authorUserId: issueComments.authorUserId,
+        createdByRunId: issueComments.createdByRunId,
+        derivedAuthorAgentId: issueComments.derivedAuthorAgentId,
+        createdAt: issueComments.createdAt,
+      })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.companyId, companyId),
+          eq(issueComments.issueId, rootIssueId),
+          eq(issueComments.id, input.boardResumeCommentId),
+          isNull(issueComments.deletedAt),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (
+      !comment?.authorUserId
+      || comment.authorAgentId
+      || comment.createdByRunId
+      || comment.derivedAuthorAgentId
+    ) {
+      throw unprocessable("Board resume comment is not a genuine board-authored comment");
+    }
+
+    const commentAudit = await db
+      .select({ actorType: activityLog.actorType, actorId: activityLog.actorId })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.comment_added"),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, rootIssueId),
+          eq(activityLog.actorType, "user"),
+          eq(activityLog.actorId, comment.authorUserId),
+          sql`${activityLog.details} ->> 'commentId' = ${comment.id}`,
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!commentAudit) {
+      throw unprocessable("Board resume comment has no matching board audit event");
+    }
+    if (sha256Utf8(comment.body) !== input.boardResumeCommentSha256) {
+      throw unprocessable("Board resume comment digest does not match stored content");
+    }
+    if (!isExplicitBoardResumeDirective(comment.body)) {
+      throw unprocessable("Board comment does not contain an explicit resume directive");
+    }
+
+    const binding = {
+      rootIssueId,
+      holdId,
+      boardResumeCommentId: input.boardResumeCommentId,
+      boardResumeCommentSha256: input.boardResumeCommentSha256,
+    };
+    const existing = await getHold(companyId, holdId);
+    if (!existing) throw notFound("Issue tree hold not found");
+    if (existing.rootIssueId !== rootIssueId) {
+      throw unprocessable("Issue tree hold does not belong to the requested root issue");
+    }
+    if (existing.mode !== "pause") {
+      throw unprocessable("Board-resume handoff can release only pause holds");
+    }
+    if (comment.createdAt < existing.createdAt) {
+      throw unprocessable("Board resume comment predates the requested hold");
+    }
+    if (isMatchingBoardResumeHandoff(existing, binding)) {
+      return { hold: existing, replayed: true };
+    }
+    if (existing.status === "released") {
+      throw conflict("Issue tree hold was released by a different operation");
+    }
+
+    try {
+      const hold = await releaseHold(companyId, rootIssueId, holdId, {
+        reason: `Board resume handoff from comment ${input.boardResumeCommentId}`,
+        metadata: {
+          handoffKind: BOARD_RESUME_HANDOFF_KIND,
+          handoffVersion: BOARD_RESUME_HANDOFF_VERSION,
+          ...binding,
+        },
+        actor: input.actor,
+      });
+      return { hold, replayed: false };
+    } catch (error) {
+      const concurrent = await getHold(companyId, holdId);
+      if (concurrent && isMatchingBoardResumeHandoff(concurrent, binding)) {
+        return { hold: concurrent, replayed: true };
+      }
+      throw error;
+    }
+  }
+
   async function cancelUnclaimedWakeupsForTree(companyId: string, rootIssueId: string, reason: string) {
     const treeIssues = await listTreeIssues(companyId, rootIssueId);
     const issueIds = treeIssues.map((issue) => issue.id);
@@ -1207,6 +1346,7 @@ export function issueTreeControlService(db: Db) {
     listHolds,
     getActivePauseHoldGate,
     releaseHold,
+    releaseHoldFromBoardResume,
     cancelUnclaimedWakeupsForTree,
   };
 }

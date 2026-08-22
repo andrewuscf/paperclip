@@ -138,6 +138,7 @@ import {
   // Issue tree
   createIssueTreeHoldSchema,
   previewIssueTreeControlSchema,
+  releaseIssueTreeHoldFromBoardResumeSchema,
   releaseIssueTreeHoldSchema,
   // Issue interactions
   createIssueThreadInteractionSchema,
@@ -826,6 +827,12 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
   "POST /api/issues/{id}/interactions/{interactionId}/withdraw",
+  "GET /api/issues/{id}/tree-control/state",
+  "POST /api/issues/{id}/tree-control/preview",
+  "GET /api/issues/{id}/tree-holds",
+  "POST /api/issues/{id}/tree-holds",
+  "GET /api/issues/{id}/tree-holds/{holdId}",
+  "POST /api/issues/{id}/tree-holds/{holdId}/release",
   "GET /api/companies/{companyId}/tools/gallery",
   "POST /api/companies/{companyId}/tools/apps/connect",
   "POST /api/companies/{companyId}/tools/apps/{connectionId}/finish",
@@ -4603,6 +4610,18 @@ registry.registerPath({
     body: jsonBody(releaseIssueTreeHoldSchema),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/tree-holds/{holdId}/board-resume-handoff",
+  tags: ["issues"],
+  summary: "Release one tree hold from an audited board resume comment",
+  request: {
+    params: z.object({ id: z.string(), holdId: z.string() }),
+    body: jsonBody(releaseIssueTreeHoldFromBoardResumeSchema),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
 });
 
 // ─── Attachments ──────────────────────────────────────────────────────────────

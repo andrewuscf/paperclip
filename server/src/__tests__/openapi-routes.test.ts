@@ -266,6 +266,27 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/execution-workspaces/{id}/reconcile-branch"].post["x-paperclip-authorization"]).toEqual({
       actor: "board",
     });
+    for (const [method, path] of [
+      ["get", "/api/issues/{id}/tree-holds"],
+      ["get", "/api/issues/{id}/tree-holds/{holdId}"],
+      ["post", "/api/issues/{id}/tree-holds/{holdId}/release"],
+    ] as const) {
+      expect(spec.paths[path][method].security).toEqual([
+        { BoardSessionAuth: [] },
+        { BoardApiKeyAuth: [] },
+      ]);
+      expect(spec.paths[path][method]["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    }
+    const boardResumeHandoff = spec.paths[
+      "/api/issues/{id}/tree-holds/{holdId}/board-resume-handoff"
+    ].post;
+    expect(boardResumeHandoff.security).toContainEqual({ AgentBearerAuth: [] });
+    expect(boardResumeHandoff["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(boardResumeHandoff.requestBody.content["application/json"].schema).toMatchObject({
+      type: "object",
+      required: expect.arrayContaining(["boardResumeCommentId", "boardResumeCommentSha256"]),
+      additionalProperties: false,
+    });
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["201"]).toBeDefined();
     expect(spec.paths["/api/companies/{companyId}/cost-events"].post.responses["403"]).toBeDefined();
     expect(spec.paths["/api/instance/database-backups"].post.responses["201"]).toBeDefined();

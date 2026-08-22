@@ -13,6 +13,7 @@ const mockTreeControlService = vi.hoisted(() => ({
   restoreIssueStatusesForHold: vi.fn(),
   getHold: vi.fn(),
   releaseHold: vi.fn(),
+  releaseHoldFromBoardResume: vi.fn(),
   cancelUnclaimedWakeupsForTree: vi.fn(),
 }));
 
@@ -98,6 +99,107 @@ describe("issue tree control routes", () => {
     expect(res.status).toBe(403);
     expect(mockIssueService.getById).not.toHaveBeenCalled();
     expect(mockTreeControlService.createHold).not.toHaveBeenCalled();
+  });
+
+  it("keeps generic hold list, get, and release operations board-only", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      companyId: "company-2",
+      runId: "99999999-9999-4999-8999-999999999999",
+      source: "agent_jwt",
+    });
+
+    const list = await request(app)
+      .get("/api/issues/11111111-1111-4111-8111-111111111111/tree-holds");
+    const get = await request(app)
+      .get("/api/issues/11111111-1111-4111-8111-111111111111/tree-holds/33333333-3333-4333-8333-333333333333");
+    const release = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/tree-holds/33333333-3333-4333-8333-333333333333/release")
+      .send({ reason: "generic release attempt" });
+
+    expect([list.status, get.status, release.status]).toEqual([403, 403, 403]);
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockTreeControlService.getHold).not.toHaveBeenCalled();
+    expect(mockTreeControlService.releaseHold).not.toHaveBeenCalled();
+  });
+
+  it("requires a run-scoped agent for a board-resume handoff", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      companyId: "company-2",
+      runId: null,
+      source: "api_key",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/tree-holds/33333333-3333-4333-8333-333333333333/board-resume-handoff")
+      .send({
+        boardResumeCommentId: "44444444-4444-4444-8444-444444444444",
+        boardResumeCommentSha256: "a".repeat(64),
+      });
+
+    expect(res.status).toBe(403);
+    expect(mockIssueService.getById).not.toHaveBeenCalled();
+    expect(mockTreeControlService.releaseHoldFromBoardResume).not.toHaveBeenCalled();
+  });
+
+  it("lets a run-scoped agent apply an exact board-resume handoff and audits the binding", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "22222222-2222-4222-8222-222222222222",
+      companyId: "company-2",
+      runId: "99999999-9999-4999-8999-999999999999",
+      source: "agent_jwt",
+    });
+    mockTreeControlService.releaseHoldFromBoardResume.mockResolvedValue({
+      hold: {
+        id: "33333333-3333-4333-8333-333333333333",
+        rootIssueId: "11111111-1111-4111-8111-111111111111",
+        mode: "pause",
+        status: "released",
+        releaseReason: "Board resume handoff",
+      },
+      replayed: false,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/tree-holds/33333333-3333-4333-8333-333333333333/board-resume-handoff")
+      .send({
+        boardResumeCommentId: "44444444-4444-4444-8444-444444444444",
+        boardResumeCommentSha256: "a".repeat(64),
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ replayed: false, hold: { status: "released" } });
+    expect(mockTreeControlService.releaseHoldFromBoardResume).toHaveBeenCalledWith(
+      "company-2",
+      "11111111-1111-4111-8111-111111111111",
+      "33333333-3333-4333-8333-333333333333",
+      expect.objectContaining({
+        boardResumeCommentId: "44444444-4444-4444-8444-444444444444",
+        boardResumeCommentSha256: "a".repeat(64),
+        actor: expect.objectContaining({
+          actorType: "agent",
+          agentId: "22222222-2222-4222-8222-222222222222",
+          runId: "99999999-9999-4999-8999-999999999999",
+        }),
+      }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.tree_hold_board_resume_handoff_applied",
+        entityId: "11111111-1111-4111-8111-111111111111",
+        details: expect.objectContaining({
+          holdId: "33333333-3333-4333-8333-333333333333",
+          boardResumeCommentId: "44444444-4444-4444-8444-444444444444",
+          boardResumeCommentSha256: "a".repeat(64),
+          replayed: false,
+        }),
+      }),
+    );
   });
 
   it("rejects malformed tree hold IDs before querying the hold service", async () => {

@@ -42,3 +42,14 @@ export const releaseIssueTreeHoldSchema = z
   .strict();
 
 export type ReleaseIssueTreeHold = z.infer<typeof releaseIssueTreeHoldSchema>;
+
+export const releaseIssueTreeHoldFromBoardResumeSchema = z
+  .object({
+    boardResumeCommentId: z.string().uuid(),
+    boardResumeCommentSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  })
+  .strict();
+
+export type ReleaseIssueTreeHoldFromBoardResume = z.infer<
+  typeof releaseIssueTreeHoldFromBoardResumeSchema
+>;
