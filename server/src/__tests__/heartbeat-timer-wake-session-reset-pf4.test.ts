@@ -36,6 +36,7 @@ describe("PF-4 shouldResetTaskSessionForWake", () => {
       "execution_review_requested",
       "execution_approval_requested",
       "execution_changes_requested",
+      "finish_successful_run_handoff",
     ] as const) {
       expect(shouldResetTaskSessionForWake({ wakeReason })).toBe(true);
     }
@@ -93,6 +94,9 @@ describe("PF-4 describeSessionResetReason", () => {
     expect(describeSessionResetReason({ wakeReason: "execution_changes_requested" })).toBe(
       "wake reason is execution_changes_requested",
     );
+    expect(describeSessionResetReason({ wakeReason: "finish_successful_run_handoff" })).toBe(
+      "wake reason is finish_successful_run_handoff",
+    );
   });
 
   it("returns the forceFreshSession message when explicitly requested", () => {
@@ -117,6 +121,7 @@ describe("PF-4 describeSessionResetReason", () => {
       { wakeReason: "execution_review_requested" },
       { wakeReason: "execution_approval_requested" },
       { wakeReason: "execution_changes_requested" },
+      { wakeReason: "finish_successful_run_handoff" },
       { forceFreshSession: true },
       { wakeReason: "issue_commented" },
       { wakeReason: "transient_failure_retry" },

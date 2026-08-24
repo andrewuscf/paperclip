@@ -4040,6 +4040,10 @@ export function shouldResetTaskSessionForWake(
     wakeReason === EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON ||
     wakeReason === "execution_approval_requested" ||
     wakeReason === "execution_changes_requested" ||
+    // Recovery handoffs launch a new run with a newly minted JWT. Reusing the
+    // prior task session can preserve stale or masked credential state, so the
+    // resumed run must start with the environment injected at adapter spawn.
+    wakeReason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON ||
     // PF-4: unscoped timer wakes are exploratory ("any new work?") and should
     // not accumulate low-value inbox scans. Issue-scoped timer wakes are
     // continuation work, so reuse their task session to avoid paying the full
@@ -4155,6 +4159,9 @@ export function describeSessionResetReason(
   }
   if (wakeReason === "execution_approval_requested") return "wake reason is execution_approval_requested";
   if (wakeReason === "execution_changes_requested") return "wake reason is execution_changes_requested";
+  if (wakeReason === FINISH_SUCCESSFUL_RUN_HANDOFF_REASON) {
+    return `wake reason is ${FINISH_SUCCESSFUL_RUN_HANDOFF_REASON}`;
+  }
   // PF-4: paired with shouldResetTaskSessionForWake — keep the reason wording
   // explicit so run logs make session reuse/reset behavior legible.
   if (wakeReason === "heartbeat_timer" && !deriveTaskKey(contextSnapshot, null)) {

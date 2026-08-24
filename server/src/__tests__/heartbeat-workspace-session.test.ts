@@ -1803,6 +1803,10 @@ describe("shouldResetTaskSessionForWake", () => {
     expect(shouldResetTaskSessionForWake({ wakeReason: "execution_changes_requested" })).toBe(true);
   });
 
+  it("resets session context on successful-run handoff recovery", () => {
+    expect(shouldResetTaskSessionForWake({ wakeReason: "finish_successful_run_handoff" })).toBe(true);
+  });
+
   it("preserves session context on timer heartbeats", () => {
     expect(shouldResetTaskSessionForWake({ wakeSource: "timer" })).toBe(false);
   });
