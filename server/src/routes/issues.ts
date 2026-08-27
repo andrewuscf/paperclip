@@ -2909,10 +2909,17 @@ export function issueRoutes(
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
-    issue: { id: string; identifier?: string | null; companyId: string },
+    issue: {
+      id: string;
+      identifier?: string | null;
+      companyId: string;
+      assigneeAgentId?: string | null;
+      status?: string | null;
+    },
     kind: CrossIssueInfluenceKind,
+    options: { allowUnscopedAssignedBlockedComment?: boolean } = {},
   ) {
-    if (req.actor.type !== "agent") return true;
+    if (req.actor.type !== "agent") return { exemption: null };
     if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
 
     // The counter transaction locks and validates the persisted run before it
@@ -2924,9 +2931,14 @@ export function issueRoutes(
       responsibleUserId: req.actor.onBehalfOfUserId ?? null,
       targetIssueId: issue.id,
       targetIssueIdentifier: issue.identifier ?? null,
+      targetIssueAssigneeAgentId: issue.assigneeAgentId ?? null,
+      targetIssueStatus: issue.status ?? null,
+      allowUnscopedAssignedBlockedComment: options.allowUnscopedAssignedBlockedComment === true,
       kind,
     });
-    if (!decision || decision.allowed) return true;
+    if (!decision) return { exemption: null };
+    if ("exemption" in decision) return { exemption: decision.exemption };
+    if (decision.allowed) return { exemption: null };
 
     const labels = await issueWriteDenialLabels(req, {
       identifier: issue.identifier ?? null,
@@ -12224,14 +12236,20 @@ export function issueRoutes(
         }) ||
         shouldResumeInProgressScheduledRetry);
     const hasUnresolvedFirstClassBlockers =
-      isBlocked && effectiveMoveToTodoRequested
+      isBlocked
         ? (await svc.getDependencyReadiness(issue.id)).unresolvedBlockerCount > 0
         : false;
     if (resumeRequested === true && isBlocked && hasUnresolvedFirstClassBlockers) {
       res.status(409).json({ error: "Issue follow-up blocked by unresolved blockers" });
       return;
     }
-    if (!(await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "comment"))) return;
+    const influence = await assertCrossIssueInfluenceWithinRunCap(req, res, issue, "comment", {
+      allowUnscopedAssignedBlockedComment:
+        isBlocked && hasUnresolvedFirstClassBlockers && !effectiveMoveToTodoRequested,
+    });
+    if (!influence) return;
+    const requiresUnscopedBlockedCommentFence =
+      influence.exemption === "unscoped_assigned_blocked_comment";
     // Reopen the closed isolated workspace only after every access, resume-intent,
     // blocker, and run-cap gate passes. A rejected comment must not rebuild and
     // republish the workspace as active, because the issue stays terminal and the
@@ -12497,18 +12515,38 @@ export function issueRoutes(
         requestedByActorId: actor.actorId,
       });
     } else {
-      comment = await svc.addComment(id, req.body.body, {
+      const commentActor = {
         agentId: actor.agentId ?? undefined,
         userId: actor.actorType === "user" ? actor.actorId : undefined,
         runId: actor.runId,
         onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
-      }, {
+      };
+      const commentOptions = {
         authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
         presentation: commentPresentation,
         metadata: req.body.metadata ?? null,
         authorizationReason: commentAuthorizationReason,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
-      });
+      };
+      if (requiresUnscopedBlockedCommentFence) {
+        comment = await db.transaction(async (tx) => {
+          const lockedIssue = await svc.getByIdForUpdate(id, tx);
+          if (
+            !lockedIssue ||
+            lockedIssue.status !== "blocked" ||
+            lockedIssue.assigneeAgentId !== actor.agentId
+          ) {
+            throw crossIssueInfluenceRunContextError();
+          }
+          const lockedReadiness = await svc.getDependencyReadiness(id, tx);
+          if (lockedReadiness.unresolvedBlockerCount < 1) {
+            throw crossIssueInfluenceRunContextError();
+          }
+          return svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
+        });
+      } else {
+        comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
+      }
     }
 
     await issueReferencesSvc.syncComment(comment.id);

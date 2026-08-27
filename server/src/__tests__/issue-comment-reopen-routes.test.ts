@@ -1326,6 +1326,104 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("attributes an assignee's blocked-issue comment as self-scoped for an unscoped heartbeat", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockObserveCrossIssueInfluence.mockResolvedValue({
+      allowed: true,
+      exemption: "unscoped_assigned_blocked_comment",
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Evidence acknowledged; blockers remain." });
+
+    expect(res.status).toBe(201);
+    expect(mockObserveCrossIssueInfluence).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        agentId: "22222222-2222-4222-8222-222222222222",
+        targetIssueId: "11111111-1111-4111-8111-111111111111",
+        targetIssueAssigneeAgentId: "22222222-2222-4222-8222-222222222222",
+        targetIssueStatus: "blocked",
+        allowUnscopedAssignedBlockedComment: true,
+        kind: "comment",
+      }),
+    );
+    expect(mockIssueService.getByIdForUpdate).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      mockTx,
+    );
+    expect(mockIssueService.getDependencyReadiness).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      mockTx,
+    );
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      "Evidence acknowledged; blockers remain.",
+      expect.anything(),
+      expect.anything(),
+      mockTx,
+    );
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["reassigned", { ...makeIssue("blocked"), assigneeAgentId: "44444444-4444-4444-8444-444444444444" }],
+    ["no longer blocked", makeIssue("todo")],
+  ])("fails closed when an unscoped comment target is concurrently %s", async (_label, lockedIssue) => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.getByIdForUpdate.mockResolvedValue(lockedIssue);
+    mockObserveCrossIssueInfluence.mockResolvedValue({
+      allowed: true,
+      exemption: "unscoped_assigned_blocked_comment",
+    });
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerIssueIds: ["33333333-3333-4333-8333-333333333333"],
+      unresolvedBlockerCount: 1,
+      allBlockersDone: false,
+      isDependencyReady: false,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Evidence acknowledged; blockers remain." });
+
+    expect(res.status).toBe(403);
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+  });
+
+  it("does not grant the unscoped comment path when a blocked issue has no unresolved blockers", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
+    mockIssueService.getDependencyReadiness.mockResolvedValue({
+      issueId: "11111111-1111-4111-8111-111111111111",
+      blockerIssueIds: [],
+      unresolvedBlockerIssueIds: [],
+      unresolvedBlockerCount: 0,
+      allBlockersDone: true,
+      isDependencyReady: true,
+    });
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "This issue can be checked out now." });
+
+    expect(res.status).toBe(201);
+    expect(mockObserveCrossIssueInfluence).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ allowUnscopedAssignedBlockedComment: false }),
+    );
+  });
+
   it("does not implicitly reopen a blocked issue via PATCH when the same request wires blockers", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("blocked"));
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });

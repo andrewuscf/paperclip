@@ -67,6 +67,23 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
+**Assigned blocked-issue acknowledgment.** Checkout correctly rejects an issue
+that still has unresolved first-class blockers. When new evidence wakes you on
+an issue that is already `blocked`, assigned to you, and must remain blocked,
+acknowledge or triage it with a direct comment instead of retrying checkout:
+
+```
+POST /api/issues/{issueId}/comments
+Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
+{ "body": "What the new evidence changes; the unresolved blocker and owner." }
+```
+
+This is a narrow comment-only path. Omit `resume`, `reopen`, status changes, and
+other issue mutation fields; the issue remains blocked. It is not authorization
+to resume deliverable work. Peer-issue comments and non-blocked targets still
+require a source-issue run context, and the normal checkout/blocker rules remain
+in force.
+
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
 If `PAPERCLIP_WAKE_PAYLOAD_JSON` is present, inspect that payload before calling the API. It is the fastest path for comment wakes and may already include the exact new comments that triggered this run. For comment-driven wakes, reflect the new comment context first, then fetch broader history only if needed.

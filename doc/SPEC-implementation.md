@@ -606,6 +606,18 @@ rollout mode, and fails closed with the cap in the error once enforcement is
 active. Writes to the run's own source issue are not counted. Assignee self-comments do not
 wake the assignee, and a non-assignee comment cannot mint a mention grant.
 
+A valid persisted heartbeat run without a source issue may post a comment to an
+already-blocked issue with unresolved first-class blockers assigned to that
+same authenticated agent when the request is comment-only and leaves the issue
+blocked. This covers unscoped timer heartbeats acknowledging new evidence while
+those blockers prevent checkout. The route revalidates the assignment, blocked
+status, and dependency readiness under the same issue-row lock used for comment
+persistence. The write is treated as self-scoped and does not consume the
+cross-issue counter. Peer-issue comments, non-blocked targets, issue updates,
+and requests that resume or reopen the issue continue to fail closed without a
+source-issue run context. The normal checkout and unresolved-blocker rules are
+unchanged.
+
 Agent-authored issue comments persist the responsible user derived from the
 authenticated actor; clients cannot choose that attribution. Each comment also
 records the write-policy reason, and spoof attempts fail with an audited 422.

@@ -27,6 +27,11 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
+export type CrossIssueInfluenceExemption = {
+  allowed: true;
+  exemption: "unscoped_assigned_blocked_comment";
+};
+
 export function crossIssueInfluenceRunContextError() {
   // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
   // so the agent reading this 403 is told the fix, not just the refusal.
@@ -76,10 +81,13 @@ export async function observeCrossIssueInfluence(
     responsibleUserId?: string | null;
     targetIssueId: string;
     targetIssueIdentifier?: string | null;
+    targetIssueAssigneeAgentId?: string | null;
+    targetIssueStatus?: string | null;
+    allowUnscopedAssignedBlockedComment?: boolean;
     kind: CrossIssueInfluenceKind;
     now?: Date;
   },
-): Promise<CrossIssueInfluenceDecision | null> {
+): Promise<CrossIssueInfluenceDecision | CrossIssueInfluenceExemption | null> {
   // API-key callers control the run header. Reject malformed UUIDs before the
   // database can turn an untrusted identifier into a PostgreSQL cast error.
   if (!isUuidLike(input.runId)) throw crossIssueInfluenceRunContextError();
@@ -110,7 +118,20 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!sourceIssueId) {
+      // Timer heartbeats have no source issue. Permit only the assignee's
+      // comment-only acknowledgement on an issue that stays blocked by an
+      // unresolved first-class dependency; the route proves both conditions.
+      const isAssignedBlockedIssueComment =
+        input.allowUnscopedAssignedBlockedComment === true &&
+        input.kind === "comment" &&
+        input.targetIssueStatus === "blocked" &&
+        input.targetIssueAssigneeAgentId === input.agentId;
+      if (isAssignedBlockedIssueComment) {
+        return { allowed: true, exemption: "unscoped_assigned_blocked_comment" };
+      }
+      throw crossIssueInfluenceRunContextError();
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
